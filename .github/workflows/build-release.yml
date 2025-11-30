@@ -1,0 +1,90 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            artifact_name: ChronoArkCSVEditor.exe
+            asset_name: ChronoArkCSVEditor-windows.exe
+          - os: ubuntu-latest
+            artifact_name: ChronoArkCSVEditor
+            asset_name: ChronoArkCSVEditor-linux
+          - os: macos-latest
+            artifact_name: ChronoArkCSVEditor
+            asset_name: ChronoArkCSVEditor-macos
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+    
+    - name: Build with PyInstaller
+      run: |
+        pyinstaller --onefile --windowed --name ChronoArkCSVEditor csv_editor.py
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.asset_name }}
+        path: dist/${{ matrix.artifact_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/ChronoArkCSVEditor-windows.exe/ChronoArkCSVEditor.exe
+          artifacts/ChronoArkCSVEditor-linux/ChronoArkCSVEditor
+          artifacts/ChronoArkCSVEditor-macos/ChronoArkCSVEditor
+        body: |
+          # Chrono Ark CSV Editor v1.0
+          
+          Initial release of the Chrono Ark CSV Editor - a GUI tool for editing and translating CSV files.
+          
+          ## Features
+          - Load and edit CSV files with a user-friendly interface
+          - Translate text using Google Translate API
+          - Support for multiple languages
+          - Save changes back to CSV format
+          
+          ## Downloads
+          - **Windows**: ChronoArkCSVEditor.exe
+          - **Linux**: ChronoArkCSVEditor
+          - **macOS**: ChronoArkCSVEditor
+          
+          ## Installation
+          Download the appropriate file for your operating system and run it. No additional installation required.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
