@@ -113,4 +113,4 @@ The translation will process each row automatically and show progress. Empty cel
 - Python 3.8+
 - PyQt6 6.4.0+
 - requests 2.28.0+ (for translation feature)
-- chardet 5.0.0
+- chardet 5.0.0+
