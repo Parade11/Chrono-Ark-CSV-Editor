@@ -1,4 +1,4 @@
-# CSV Editor - Translation Tool
+# CSV Editor - For Chrono Ark
 
 A modern Python desktop application for editing CSV files, designed to simplify translation workflows.
 
@@ -106,7 +106,7 @@ Automatically translate content from one column to another using DeepL (no setup
 
 The translation will process each row automatically and show progress. Empty cells are skipped.
 
-**Note:** Uses free DeepLX API endpoints. No API key or server setup required! May be rate-limited if used very frequently. The app automatically switches between multiple endpoints if one is unavailable.
+**Note:** App uses free DeepLX API endpoints. No API key or server setup required. May be rate-limited if used very frequently.
 
 ## Requirements
 
