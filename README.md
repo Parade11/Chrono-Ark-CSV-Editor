@@ -104,7 +104,7 @@ Automatically translate content from one column to another using DeepL (no setup
    - ES = Spanish
    - And more...
 
-The translation will process each row automatically and show progress. Empty cells are skipped.
+The translation will process each row automatically and show progress. Empty cells are skipped. You can also translate specific cells.
 
 **Note:** App uses free DeepLX API endpoints. No API key or server setup required. May be rate-limited if used very frequently.
 
