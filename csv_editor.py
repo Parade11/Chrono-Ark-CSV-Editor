@@ -6,6 +6,7 @@ import requests
 import subprocess
 import platform
 import time
+import chardet
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTableWidget,
@@ -77,6 +78,9 @@ class CSVEditorWindow(QMainWindow):
         # Enable context menu on cells
         self.csv_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.csv_table.customContextMenuRequested.connect(self.show_cell_context_menu)
+        
+        # Connect cell change signal to track edits
+        self.csv_table.itemChanged.connect(self.on_cell_changed)
         
         splitter.addWidget(self.csv_table)
         
@@ -196,13 +200,59 @@ class CSVEditorWindow(QMainWindow):
         self.load_csv_file(file_path)
         
     def load_csv_file(self, file_path):
-        """Load CSV file into table"""
+        """Load CSV file into table with encoding and dialect detection"""
         try:
+            # Step 1: Detect file encoding
+            encoding = 'utf-8'  # Default
+            try:
+                with open(file_path, 'rb') as f:
+                    raw_data = f.read()
+                    result = chardet.detect(raw_data)
+                    if result['encoding']:
+                        encoding = result['encoding']
+                        print(f"Detected encoding: {encoding} (confidence: {result['confidence']})")
+            except Exception as e:
+                print(f"Encoding detection failed, using UTF-8: {e}")
+            
+            # Step 2: Read sample to detect CSV dialect
+            dialect = None
+            try:
+                with open(file_path, 'r', encoding=encoding, newline='') as f:
+                    sample = f.read(8192)  # Read first 8KB
+                    sniffer = csv.Sniffer()
+                    dialect = sniffer.sniff(sample)
+                    print(f"Detected delimiter: '{dialect.delimiter}'")
+            except Exception as e:
+                print(f"Dialect detection failed, using default: {e}")
+            
+            # Step 3: Load CSV data with detected settings
             self.csv_data = []
-            with open(file_path, 'r', encoding='utf-8', newline='') as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    self.csv_data.append(row)
+            encodings_to_try = [encoding, 'utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+            
+            for enc in encodings_to_try:
+                try:
+                    with open(file_path, 'r', encoding=enc, newline='') as f:
+                        if dialect:
+                            reader = csv.reader(f, dialect=dialect)
+                        else:
+                            reader = csv.reader(f)
+                        
+                        self.csv_data = []
+                        for row in reader:
+                            self.csv_data.append(row)
+                    
+                    # Successfully loaded
+                    print(f"Successfully loaded with encoding: {enc}")
+                    break
+                    
+                except UnicodeDecodeError:
+                    if enc == encodings_to_try[-1]:
+                        raise  # Re-raise if last encoding fails
+                    continue
+                except Exception as e:
+                    if enc == encodings_to_try[-1]:
+                        raise
+                    continue
             
             if not self.csv_data:
                 QMessageBox.warning(self, "Empty File", "The CSV file is empty.")
@@ -210,28 +260,96 @@ class CSVEditorWindow(QMainWindow):
             
             self.current_file = file_path
             self.display_csv_data()
-            self.status_bar.showMessage(f"Loaded: {Path(file_path).name}")
+            self.status_bar.showMessage(f"Loaded: {Path(file_path).name} ({encoding})")
             
+        except UnicodeDecodeError as e:
+            QMessageBox.critical(
+                self, "Encoding Error",
+                f"Failed to decode file:\n{str(e)}\n\n"
+                "The file may be using an unsupported encoding."
+            )
+        except csv.Error as e:
+            QMessageBox.critical(
+                self, "CSV Error",
+                f"Failed to parse CSV file:\n{str(e)}\n\n"
+                "The file may be malformed or not a valid CSV."
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load file:\n{str(e)}")
+            QMessageBox.critical(
+                self, "Error",
+                f"Failed to load file:\n{str(e)}"
+            )
             
     def display_csv_data(self):
         """Display CSV data in table widget"""
-        if not self.csv_data:
+        try:
+            if not self.csv_data or len(self.csv_data) == 0:
+                return
+            
+            # Get header row and expected column count
+            headers = self.csv_data[0]
+            expected_col_count = len(headers)
+            
+            if expected_col_count == 0:
+                QMessageBox.warning(self, "Invalid CSV", "CSV file has no columns.")
+                return
+            
+            # Validate and normalize all data rows
+            normalized_data = [headers]
+            for row_idx, row_data in enumerate(self.csv_data[1:], start=1):
+                # Ensure row_data is a list
+                if not isinstance(row_data, list):
+                    row_data = [str(row_data)]
+                
+                # Ensure row has correct number of columns
+                if len(row_data) < expected_col_count:
+                    # Pad with empty strings
+                    row_data = list(row_data) + [""] * (expected_col_count - len(row_data))
+                elif len(row_data) > expected_col_count:
+                    # Truncate extra columns
+                    row_data = row_data[:expected_col_count]
+                
+                normalized_data.append(row_data)
+            
+            # Update csv_data with normalized data
+            self.csv_data = normalized_data
+            
+            # Set table dimensions (exclude header row from row count)
+            self.csv_table.setRowCount(len(self.csv_data) - 1)
+            self.csv_table.setColumnCount(expected_col_count)
+            
+            # Set headers (first row)
+            self.csv_table.setHorizontalHeaderLabels(headers)
+            
+            # Temporarily disconnect itemChanged signal to avoid triggering during load
+            self.csv_table.itemChanged.disconnect(self.on_cell_changed)
+            
+            # Populate table (skip header row)
+            for row_idx, row_data in enumerate(self.csv_data[1:]):
+                # Double-check bounds
+                if row_idx >= self.csv_table.rowCount():
+                    break
+                
+                for col_idx in range(min(len(row_data), expected_col_count)):
+                    try:
+                        # Safely get cell data with bounds checking
+                        cell_data = row_data[col_idx] if col_idx < len(row_data) else ""
+                        item = QTableWidgetItem(str(cell_data) if cell_data is not None else "")
+                        self.csv_table.setItem(row_idx, col_idx, item)
+                    except (IndexError, ValueError) as e:
+                        # If there's an error with a specific cell, just use empty string
+                        print(f"Warning: Error setting cell [{row_idx}, {col_idx}]: {e}")
+                        self.csv_table.setItem(row_idx, col_idx, QTableWidgetItem(""))
+            
+            # Reconnect itemChanged signal after loading
+            self.csv_table.itemChanged.connect(self.on_cell_changed)
+        
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Display Error",
+                f"Failed to display CSV data:\n{str(e)}\n\nThe file may be malformed."
+            )
             return
-        
-        # Set table dimensions
-        self.csv_table.setRowCount(len(self.csv_data))
-        self.csv_table.setColumnCount(len(self.csv_data[0]))
-        
-        # Set headers (first row)
-        self.csv_table.setHorizontalHeaderLabels(self.csv_data[0])
-        
-        # Populate table
-        for row_idx, row_data in enumerate(self.csv_data[1:], start=1):
-            for col_idx, cell_data in enumerate(row_data):
-                item = QTableWidgetItem(cell_data)
-                self.csv_table.setItem(row_idx - 1, col_idx, item)
         
         # Adjust column widths with minimum width for better scrolling
         self.csv_table.resizeColumnsToContents()
@@ -243,6 +361,56 @@ class CSVEditorWindow(QMainWindow):
         
 
             
+    def on_cell_changed(self, item):
+        """Handle individual cell changes and update csv_data"""
+        if not self.csv_data or not item:
+            return
+        
+        try:
+            row = item.row()
+            col = item.column()
+            
+            # Update csv_data (row + 1 because csv_data[0] is headers)
+            data_row = row + 1
+            
+            # Ensure csv_data has enough rows
+            while len(self.csv_data) <= data_row:
+                # Add empty row with correct number of columns
+                self.csv_data.append([""] * self.csv_table.columnCount())
+            
+            # Ensure the row has enough columns
+            while len(self.csv_data[data_row]) <= col:
+                self.csv_data[data_row].append("")
+            
+            # Update the specific cell
+            self.csv_data[data_row][col] = item.text()
+            
+        except Exception as e:
+            print(f"Error updating cell data: {e}")
+    
+    def sync_csv_data_from_table(self):
+        """Synchronize self.csv_data with current table contents"""
+        if not self.csv_table.rowCount() or not self.csv_table.columnCount():
+            return
+        
+        # Collect headers from table
+        headers = []
+        for col in range(self.csv_table.columnCount()):
+            header_item = self.csv_table.horizontalHeaderItem(col)
+            headers.append(header_item.text() if header_item else f"Column {col}")
+        
+        # Collect all rows
+        data = [headers]
+        for row in range(self.csv_table.rowCount()):
+            row_data = []
+            for col in range(self.csv_table.columnCount()):
+                item = self.csv_table.item(row, col)
+                row_data.append(item.text() if item else "")
+            data.append(row_data)
+        
+        # Update csv_data
+        self.csv_data = data
+    
     def save_file(self):
         """Save current CSV file"""
         if not self.current_file:
@@ -250,19 +418,13 @@ class CSVEditorWindow(QMainWindow):
             return
         
         try:
-            # Collect data from table
-            data = [self.csv_data[0]]  # Keep original headers
-            for row in range(self.csv_table.rowCount()):
-                row_data = []
-                for col in range(self.csv_table.columnCount()):
-                    item = self.csv_table.item(row, col)
-                    row_data.append(item.text() if item else "")
-                data.append(row_data)
+            # Sync data from table to csv_data
+            self.sync_csv_data_from_table()
             
             # Write to file with quotes around all non-empty fields
             with open(self.current_file, 'w', encoding='utf-8', newline='') as f:
                 writer = csv.writer(f, quoting=csv.QUOTE_NONNUMERIC, lineterminator='\n')
-                writer.writerows(data)
+                writer.writerows(self.csv_data)
             
             self.status_bar.showMessage(f"Saved: {Path(self.current_file).name}")
             QMessageBox.information(self, "Success", "File saved successfully!")
@@ -307,10 +469,8 @@ class CSVEditorWindow(QMainWindow):
             self.csv_table.insertColumn(col_count)
             self.csv_table.setHorizontalHeaderItem(col_count, QTableWidgetItem(column_name))
             
-            # Update csv_data
-            self.csv_data[0].append(column_name)
-            for i in range(1, len(self.csv_data)):
-                self.csv_data[i].append("")
+            # Sync data to ensure consistency
+            self.sync_csv_data_from_table()
             
             # Set column width
             self.csv_table.setColumnWidth(col_count, 150)
@@ -337,10 +497,8 @@ class CSVEditorWindow(QMainWindow):
             self.csv_table.insertColumn(current_col)
             self.csv_table.setHorizontalHeaderItem(current_col, QTableWidgetItem(column_name))
             
-            # Update csv_data
-            self.csv_data[0].insert(current_col, column_name)
-            for i in range(1, len(self.csv_data)):
-                self.csv_data[i].insert(current_col, "")
+            # Sync data to ensure consistency
+            self.sync_csv_data_from_table()
             
             # Set column width
             self.csv_table.setColumnWidth(current_col, 150)
@@ -358,7 +516,9 @@ class CSVEditorWindow(QMainWindow):
             QMessageBox.warning(self, "No Selection", "Please select a column to delete.")
             return
         
-        column_name = self.csv_table.horizontalHeaderItem(current_col).text()
+        # Safely get column name with null check
+        header_item = self.csv_table.horizontalHeaderItem(current_col)
+        column_name = header_item.text() if header_item else f"Column {current_col}"
         
         reply = QMessageBox.question(
             self, "Delete Column",
@@ -370,10 +530,8 @@ class CSVEditorWindow(QMainWindow):
             # Remove column from table
             self.csv_table.removeColumn(current_col)
             
-            # Update csv_data
-            del self.csv_data[0][current_col]
-            for i in range(1, len(self.csv_data)):
-                del self.csv_data[i][current_col]
+            # Sync data to ensure consistency
+            self.sync_csv_data_from_table()
             
             self.status_bar.showMessage(f"Deleted column: {column_name}")
     
