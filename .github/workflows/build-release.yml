@@ -67,13 +67,25 @@ jobs:
       with:
         path: artifacts
     
+    - name: List artifacts (debug)
+      run: ls -R artifacts
+    
+    - name: Prepare release files
+      run: |
+        mkdir -p release
+        cp artifacts/ChronoArkCSVEditor-windows.exe/ChronoArkCSVEditor.exe release/ChronoArkCSVEditor-windows.exe
+        cp artifacts/ChronoArkCSVEditor-linux/ChronoArkCSVEditor release/ChronoArkCSVEditor-linux
+        cp artifacts/ChronoArkCSVEditor-macos/ChronoArkCSVEditor release/ChronoArkCSVEditor-macos
+        chmod +x release/ChronoArkCSVEditor-linux
+        chmod +x release/ChronoArkCSVEditor-macos
+    
     - name: Create Release
       uses: softprops/action-gh-release@v1
       with:
         files: |
-          artifacts/ChronoArkCSVEditor-windows.exe/ChronoArkCSVEditor.exe
-          artifacts/ChronoArkCSVEditor-linux/ChronoArkCSVEditor
-          artifacts/ChronoArkCSVEditor-macos/ChronoArkCSVEditor
+          release/ChronoArkCSVEditor-windows.exe
+          release/ChronoArkCSVEditor-linux
+          release/ChronoArkCSVEditor-macos
         body: |
           # Chrono Ark CSV Editor v1.0
           
