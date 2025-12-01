@@ -12,6 +12,8 @@ A modern Python desktop application for editing CSV files, designed to simplify 
 - **Save Functionality**: Save changes with Ctrl+S or through the File menu
 - **Remove Files**: Remove files from the list when no longer needed
 - **Modern UI**: Clean, professional interface built with PyQt6
+- **Multiple Translation Services**: Support for Google Translate, LibreTranslate, and MyMemory with automatic fallback
+- **Configurable Translation Settings**: Customize timeouts, retries, and service priorities
 
 ## Installation
 
@@ -82,16 +84,17 @@ You can also:
 - **Insert a column** at a specific position: Select a column, then `Edit > Insert Column Before...`
 - **Delete a column**: Select a column, then `Edit > Delete Column` (or `Ctrl+Shift+D`)
 
-### Translating Columns with DeepL
+### Translating Columns with Multiple Services
 
-Automatically translate content from one column to another using DeepL (no setup required!):
+Automatically translate content from one column to another using multiple translation services:
 
 1. **Translate a column**:
    - Right-click on the target column header (e.g., "Korean")
-   - Select "Translate Column with DeepL..."
+   - Select "Translate Column..."
    - Choose source column (e.g., "English")
    - Enter source language code (e.g., "EN")
    - Enter target language code (e.g., "KO")
+   - Select preferred translation service or use automatic fallback
    - Click "Translate"
 
 2. **Language codes**:
@@ -104,9 +107,26 @@ Automatically translate content from one column to another using DeepL (no setup
    - ES = Spanish
    - And more...
 
-The translation will process each row automatically and show progress. Empty cells are skipped. You can also translate specific cells.
+The app supports multiple translation services: Google Translate, LibreTranslate, and MyMemory.
 
-**Note:** App uses free DeepLX API endpoints. No API key or server setup required. May be rate-limited if used very frequently.
+#### Configuring Translation Services
+
+To configure translation services:
+1. Go to `Settings > Translation Services Configuration`
+2. Enable/disable specific services
+3. Set priority order for fallback
+4. Configure custom URLs (e.g., for LibreTranslate)
+5. Adjust timeouts and retry settings
+
+The automatic fallback mechanism tries services in priority order.
+
+## Translation Services
+
+The app supports multiple translation services with different strengths:
+
+- **Google Translate**: Reliable and widely supported, with a free tier available; good for most languages.
+- **LibreTranslate**: Open-source and self-hostable, privacy-focused; requires a server URL.
+- **MyMemory**: Free up to 1000 requests per day, suitable for small batches and occasional use.
 
 ## Requirements
 
@@ -114,3 +134,6 @@ The translation will process each row automatically and show progress. Empty cel
 - PyQt6 6.4.0+
 - requests 2.28.0+ (for translation feature)
 - chardet 5.0.0+
+- deep-translator 1.11.4+ (for alternative translation services)
+- tenacity 8.2.0+ (for retry logic)
+- urllib3 2.0.0+ (for HTTP handling)

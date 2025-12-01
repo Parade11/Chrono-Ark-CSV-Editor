@@ -8,17 +8,36 @@ import platform
 import time
 import chardet
 import re
+import random
 from pathlib import Path
+from enum import Enum
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTableWidget,
                              QTableWidgetItem, QSplitter, QMenuBar, QMenu, QFileDialog,
                              QMessageBox, QStatusBar, QInputDialog, QDialog, QLabel,
                              QComboBox, QLineEdit, QPushButton, QFormLayout, QProgressDialog,
-                             QTextEdit, QGroupBox, QCheckBox)
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+                             QTextEdit, QGroupBox, QCheckBox, QSpinBox, QDoubleSpinBox,
+                             QListWidget, QListWidgetItem, QHBoxLayout)
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QThreadPool, QRunnable
 from PyQt6.QtGui import QAction, QKeySequence, QColor
 
-DEEPLX_AVAILABLE = True  # We'll use direct API calls
+# New imports for translation services
+try:
+    from deep_translator import GoogleTranslator, LibreTranslator, MyMemoryTranslator
+    DEEP_TRANSLATOR_AVAILABLE = True
+except ImportError:
+    DEEP_TRANSLATOR_AVAILABLE = False
+
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    TENACITY_AVAILABLE = True
+except ImportError:
+    TENACITY_AVAILABLE = False
+
+class TranslationService(Enum):
+    GOOGLE = "google"
+    LIBRETRANSLATE = "libretranslate"
+    MYMEMORY = "mymemory"
 
 
 class CSVEditorWindow(QMainWindow):
@@ -27,18 +46,48 @@ class CSVEditorWindow(QMainWindow):
         self.current_file = None
         self.csv_data = []
         self.imported_files = []  # Track imported files
-        self.deeplx_process = None  # Track DeepLX process
-        self.deeplx_path = Path.home() / ".csv_editor" / "deeplx"
         self.search_results = []  # Store search results
         self.current_search_index = -1  # Current position in search results
         self.search_active = False  # Flag to prevent clearing during navigation
         self.file_data_cache = {}  # Cache data for all imported files {file_path: csv_data}
         self.modified_files = set()  # Track which files have been modified
+        self.config = {}
+        self.translation_log = []
+        self.endpoint_status = {}
+        self.circuit_breaker = {}  # Track failures per endpoint
+        self.last_successful_translation = None
+        self.load_config()
         self.init_ui()
         
-        # Auto-start DeepLX if it's installed but not running
-        QTimer.singleShot(1000, self.auto_start_deeplx)
+    def load_config(self):
+        config_path = Path.home() / ".csv_editor" / "config.json"
+        if config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    self.config = json.load(f)
+            except:
+                self.config = {}
+        else:
+            self.config = {}
         
+        # Set defaults
+        self.config.setdefault('preferred_service', 'google')
+        self.config.setdefault('custom_libretranslate_url', 'https://libretranslate.com/translate')
+        self.config.setdefault('request_timeout', 15)
+        self.config.setdefault('retry_count', 3)
+        self.config.setdefault('base_delay', 8.0)
+        self.config.setdefault('enabled_services', ['google', 'libretranslate', 'mymemory'])
+        self.config.setdefault('priority_order', ['google', 'libretranslate', 'mymemory'])
+        self.config.setdefault('last_successful_endpoints', {})
+        self.config.setdefault('circuit_breaker_threshold', 5)
+        self.config.setdefault('circuit_breaker_timeout', 300)  # 5 minutes
+    
+    def save_config(self):
+        config_path = Path.home() / ".csv_editor" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, 'w') as f:
+            json.dump(self.config, f, indent=2)
+    
     def init_ui(self):
         self.setWindowTitle("CSV Editor - Translation Tool")
         self.setGeometry(100, 100, 1200, 700)
@@ -221,9 +270,13 @@ class CSVEditorWindow(QMainWindow):
         # Settings menu
         settings_menu = menubar.addMenu("Settings")
         
-        deeplx_settings_action = QAction("DeepLX Translation Settings...", self)
-        deeplx_settings_action.triggered.connect(self.show_deeplx_settings)
-        settings_menu.addAction(deeplx_settings_action)
+        translation_config_action = QAction("Translation Services Configuration...", self)
+        translation_config_action.triggered.connect(self.show_translation_config_dialog)
+        settings_menu.addAction(translation_config_action)
+        
+        view_log_action = QAction("View Translation Log...", self)
+        view_log_action.triggered.connect(self.show_translation_log)
+        settings_menu.addAction(view_log_action)
         
     def import_file(self):
         """Import CSV file(s) into the application"""
@@ -864,7 +917,7 @@ class CSVEditorWindow(QMainWindow):
     def delete_column(self):
         """Delete the selected column"""
         if not self.current_file:
-            QMessageBox.warning(self, "No File", "Please load a CSV file first.")
+            QMessageBox.warning(self, "No File", "Please select a column to delete.")
             return
         
         current_col = self.csv_table.currentColumn()
@@ -1389,317 +1442,175 @@ class CSVEditorWindow(QMainWindow):
         
         dialog.exec()
     
-    def show_deeplx_settings(self):
-        """Show DeepLX settings dialog"""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("DeepLX Translation Settings")
-        dialog.setMinimumWidth(500)
-        dialog.setMinimumHeight(400)
-        
-        layout = QVBoxLayout()
-        
-        # Status group
-        status_group = QGroupBox("DeepLX Status")
-        status_layout = QVBoxLayout()
-        
-        status_label = QLabel("Checking DeepLX status...")
-        status_layout.addWidget(status_label)
-        
-        status_group.setLayout(status_layout)
-        layout.addWidget(status_group)
-        
-        # Check if DeepLX is running
-        def check_deeplx_status():
-            try:
-                response = requests.get("http://127.0.0.1:1188", timeout=2)
-                status_label.setText("✓ DeepLX is running on port 1188")
-                status_label.setStyleSheet("color: green; font-weight: bold;")
-                start_btn.setEnabled(False)
-                stop_btn.setEnabled(True)
-                return True
-            except:
-                status_label.setText("✗ DeepLX is not running")
-                status_label.setStyleSheet("color: red; font-weight: bold;")
-                start_btn.setEnabled(True)
-                stop_btn.setEnabled(False)
-                return False
-        
-        # Control buttons
-        button_group = QGroupBox("DeepLX Control")
-        button_layout = QVBoxLayout()
-        
-        # Download and setup button
-        setup_btn = QPushButton("Download && Setup DeepLX")
-        setup_btn.clicked.connect(lambda: self.download_deeplx(dialog, status_label, check_deeplx_status))
-        button_layout.addWidget(setup_btn)
-        
-        # Start button
-        start_btn = QPushButton("Start DeepLX Server")
-        start_btn.clicked.connect(lambda: self.start_deeplx(status_label, check_deeplx_status))
-        button_layout.addWidget(start_btn)
-        
-        # Stop button
-        stop_btn = QPushButton("Stop DeepLX Server")
-        stop_btn.clicked.connect(lambda: self.stop_deeplx(status_label, check_deeplx_status))
-        button_layout.addWidget(stop_btn)
-        
-        button_group.setLayout(button_layout)
-        layout.addWidget(button_group)
-        
-        # Info text
-        info_group = QGroupBox("Information")
-        info_layout = QVBoxLayout()
-        
-        info_text = QTextEdit()
-        info_text.setReadOnly(True)
-        info_text.setMaximumHeight(150)
-        info_text.setPlainText(
-            "1. Click 'Download & Setup DeepLX' to automatically download it\n"
-            "2. Click 'Start DeepLX Server' to run it locally\n"
-            "3. Use the translation feature in the app\n\n"
-            "The server runs on http://127.0.0.1:1188"
-        )
-        info_layout.addWidget(info_text)
-        
-        info_group.setLayout(info_layout)
-        layout.addWidget(info_group)
-        
-        # Close button
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dialog.accept)
-        layout.addWidget(close_btn)
-        
-        dialog.setLayout(layout)
-        
-        # Initial status check
-        check_deeplx_status()
-        
-        dialog.exec()
+
     
-    def download_deeplx(self, parent_dialog, status_label, check_status_func):
-        """Download DeepLX binary"""
-        system = platform.system()
-        machine = platform.machine().lower()
-        
-        # Determine download URL based on OS
-        # First, get the latest release info
-        try:
-            release_response = requests.get(
-                "https://api.github.com/repos/OwO-Network/DeepLX/releases/latest",
-                timeout=10
-            )
-            release_response.raise_for_status()
-            release_data = release_response.json()
-            assets = release_data.get("assets", [])
-            
-            # Find the correct asset for this platform
-            if system == "Windows":
-                if "amd64" in machine or "x86_64" in machine:
-                    asset_name = "deeplx_windows_amd64.exe"
-                elif "386" in machine or "x86" in machine:
-                    asset_name = "deeplx_windows_386.exe"
-                else:
-                    QMessageBox.warning(parent_dialog, "Unsupported", "Your Windows architecture is not supported.")
-                    return
-                exe_name = "deeplx.exe"
-            elif system == "Linux":
-                if "amd64" in machine or "x86_64" in machine:
-                    asset_name = "deeplx_linux_amd64"
-                elif "arm64" in machine or "aarch64" in machine:
-                    asset_name = "deeplx_linux_arm64"
-                elif "386" in machine or "i686" in machine:
-                    asset_name = "deeplx_linux_386"
-                else:
-                    QMessageBox.warning(parent_dialog, "Unsupported", "Your Linux architecture is not supported.")
-                    return
-                exe_name = "deeplx"
-            elif system == "Darwin":  # macOS
-                if "arm" in machine or "aarch64" in machine:
-                    asset_name = "deeplx_darwin_arm64"
-                else:
-                    asset_name = "deeplx_darwin_amd64"
-                exe_name = "deeplx"
-            else:
-                QMessageBox.warning(parent_dialog, "Unsupported", f"Your operating system ({system}) is not supported.")
-                return
-            
-            # Find the download URL for the asset
-            url = None
-            for asset in assets:
-                if asset.get("name") == asset_name:
-                    url = asset.get("browser_download_url")
-                    break
-            
-            if not url:
-                QMessageBox.warning(
-                    parent_dialog, "Not Found",
-                    f"Could not find {asset_name} in the latest release.\n\n"
-                    "Please download manually from:\n"
-                    "https://github.com/OwO-Network/DeepLX/releases"
-                )
-                return
-                
-        except Exception as e:
-            QMessageBox.critical(
-                parent_dialog, "Error",
-                f"Failed to get release information:\n{str(e)}\n\n"
-                "Please download manually from:\n"
-                "https://github.com/OwO-Network/DeepLX/releases"
-            )
-            return
-        
-        # Create progress dialog
-        progress = QProgressDialog("Downloading DeepLX...", "Cancel", 0, 100, parent_dialog)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(0)
-        
-        try:
-            # Create directory
-            self.deeplx_path.mkdir(parents=True, exist_ok=True)
-            
-            # Download file directly (it's an executable, not a zip)
-            status_label.setText("Downloading DeepLX...")
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            
-            total_size = int(response.headers.get('content-length', 0))
-            exe_path = self.deeplx_path / exe_name
-            
-            downloaded = 0
-            with open(exe_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if progress.wasCanceled():
-                        return
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        progress.setValue(int(downloaded * 100 / total_size))
-            
-            # Make executable on Unix systems
-            if system != "Windows":
-                os.chmod(exe_path, 0o755)
-            
-            progress.setValue(100)
-            status_label.setText("✓ DeepLX downloaded successfully!")
-            status_label.setStyleSheet("color: green; font-weight: bold;")
-            
-            QMessageBox.information(
-                parent_dialog, "Success",
-                "DeepLX has been downloaded successfully!\n\n"
-                "Click 'Start DeepLX Server' to run it."
-            )
-            
-        except Exception as e:
-            status_label.setText(f"✗ Download failed: {str(e)}")
-            status_label.setStyleSheet("color: red; font-weight: bold;")
-            QMessageBox.critical(parent_dialog, "Download Failed", f"Failed to download DeepLX:\n{str(e)}")
+    def translate_with_google(self, text, source_lang, target_lang):
+        if not DEEP_TRANSLATOR_AVAILABLE:
+            raise Exception("deep-translator not available")
+        translator = GoogleTranslator(source=source_lang.lower(), target=target_lang.lower())
+        return translator.translate(text)
     
-    def start_deeplx(self, status_label, check_status_func):
-        """Start DeepLX server"""
-        system = platform.system()
-        exe_name = "deeplx.exe" if system == "Windows" else "deeplx"
-        exe_path = self.deeplx_path / exe_name
-        
-        if not exe_path.exists():
-            QMessageBox.warning(
-                self, "DeepLX Not Found",
-                "DeepLX is not installed.\n\n"
-                "Click 'Download & Setup DeepLX' first."
-            )
-            return
-        
-        try:
-            # Start DeepLX process
-            if system == "Windows":
-                self.deeplx_process = subprocess.Popen(
-                    [str(exe_path)],
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-            else:
-                self.deeplx_process = subprocess.Popen(
-                    [str(exe_path)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-            
-            status_label.setText("Starting DeepLX...")
-            status_label.setStyleSheet("color: orange; font-weight: bold;")
-            
-            # Wait a moment and check status
-            QTimer.singleShot(2000, check_status_func)
-            
-            self.status_bar.showMessage("DeepLX server started")
-            
-        except Exception as e:
-            status_label.setText(f"✗ Failed to start: {str(e)}")
-            status_label.setStyleSheet("color: red; font-weight: bold;")
-            QMessageBox.critical(self, "Start Failed", f"Failed to start DeepLX:\n{str(e)}")
+    def translate_with_libretranslate(self, text, source_lang, target_lang):
+        if not DEEP_TRANSLATOR_AVAILABLE:
+            raise Exception("deep-translator not available")
+        url = self.config.get('custom_libretranslate_url', 'https://libretranslate.com/translate')
+        translator = LibreTranslator(base_url=url, source=source_lang.lower(), target=target_lang.lower())
+        return translator.translate(text)
     
-    def stop_deeplx(self, status_label, check_status_func):
-        """Stop DeepLX server"""
-        if self.deeplx_process:
-            try:
-                self.deeplx_process.terminate()
-                self.deeplx_process.wait(timeout=5)
-                self.deeplx_process = None
-                status_label.setText("✗ DeepLX stopped")
-                status_label.setStyleSheet("color: red; font-weight: bold;")
-                self.status_bar.showMessage("DeepLX server stopped")
-                check_status_func()
-            except Exception as e:
-                QMessageBox.warning(self, "Stop Failed", f"Failed to stop DeepLX:\n{str(e)}")
+    def translate_with_mymemory(self, text, source_lang, target_lang):
+        if not DEEP_TRANSLATOR_AVAILABLE:
+            raise Exception("deep-translator not available")
+        translator = MyMemoryTranslator(source=source_lang.lower(), target=target_lang.lower())
+        return translator.translate(text)
+    
+    def translate_text(self, text, source_lang, target_lang):
+        """
+        Translate text using available services with centralized retry logic.
+        Returns tuple of (translated_text, service_used).
+        
+        If tenacity is available, retries are handled by the decorator.
+        Otherwise, falls back to simple retry logic.
+        """
+        if TENACITY_AVAILABLE:
+            return self._translate_text_with_retry(text, source_lang, target_lang)
         else:
-            QMessageBox.information(self, "Not Running", "DeepLX is not running from this application.")
+            return self._translate_text_simple_retry(text, source_lang, target_lang)
     
-    def auto_start_deeplx(self):
-        """Automatically start DeepLX if installed but not running"""
-        # Check if DeepLX is already running
-        try:
-            response = requests.get("http://127.0.0.1:1188", timeout=1)
-            # Already running, no need to start
-            return
-        except:
-            pass
+    def _translate_text_core(self, text, source_lang, target_lang):
+        """Core translation logic that tries each service in priority order."""
+        services = self.config['priority_order']
+        last_exception = None
         
-        # Check if DeepLX is installed
-        system = platform.system()
-        exe_name = "deeplx.exe" if system == "Windows" else "deeplx"
-        exe_path = self.deeplx_path / exe_name
-        
-        if exe_path.exists():
-            # Start it automatically
+        for service in services:
+            if service not in self.config['enabled_services']:
+                continue
             try:
-                if system == "Windows":
-                    self.deeplx_process = subprocess.Popen(
-                        [str(exe_path)],
-                        creationflags=subprocess.CREATE_NO_WINDOW
-                    )
+                if service == 'google':
+                    result = self.translate_with_google(text, source_lang, target_lang)
+                elif service == 'libretranslate':
+                    result = self.translate_with_libretranslate(text, source_lang, target_lang)
+                elif service == 'mymemory':
+                    result = self.translate_with_mymemory(text, source_lang, target_lang)
                 else:
-                    self.deeplx_process = subprocess.Popen(
-                        [str(exe_path)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                self.status_bar.showMessage("DeepLX server started automatically")
+                    continue
+                self.log_translation(text, result, service, True, "")
+                return (result, service)
             except Exception as e:
-                print(f"Failed to auto-start DeepLX: {e}")
+                self.log_translation(text, '', service, False, str(e))
+                last_exception = e
+                continue
+        
+        # All services failed
+        raise last_exception if last_exception else Exception("All translation services failed")
     
-    def closeEvent(self, event):
-        """Clean up when closing the application"""
-        if self.deeplx_process:
+    def _translate_text_with_retry(self, text, source_lang, target_lang):
+        """Translation with tenacity retry decorator."""
+        # Create a retry decorator dynamically based on config
+        retry_decorator = retry(
+            stop=stop_after_attempt(self.config['retry_count']),
+            wait=wait_exponential(multiplier=1, min=1, max=10),
+            reraise=True
+        )
+        
+        # Apply decorator to core translation function
+        retrying_translate = retry_decorator(self._translate_text_core)
+        return retrying_translate(text, source_lang, target_lang)
+    
+    def _translate_text_simple_retry(self, text, source_lang, target_lang):
+        """Fallback translation with simple retry logic when tenacity is not available."""
+        max_retries = self.config['retry_count']
+        last_exception = None
+        
+        for attempt in range(max_retries):
             try:
-                self.deeplx_process.terminate()
-                self.deeplx_process.wait(timeout=5)
-            except:
-                pass
-        event.accept()
+                return self._translate_text_core(text, source_lang, target_lang)
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    # Simple exponential backoff
+                    wait_time = min(10, 2 ** attempt)
+                    time.sleep(wait_time)
+                continue
+        
+        # All retries exhausted
+        raise last_exception if last_exception else Exception("All translation services failed")
+    
+    def log_translation(self, source_text, target_text, service, success, error_msg):
+        self.translation_log.append({
+            'timestamp': time.time(),
+            'source': source_text,
+            'target': target_text,
+            'service': service,
+            'success': success,
+            'error': error_msg
+        })
+        if len(self.translation_log) > 1000:
+            self.translation_log = self.translation_log[-1000:]
+    
+
+    
+    def check_endpoint_health(self):
+        self.endpoint_status = {}
+        
+        # Only mark Google/LibreTranslate/MyMemory as available if deep-translator is installed
+        if DEEP_TRANSLATOR_AVAILABLE:
+            self.endpoint_status['google'] = True
+            self.endpoint_status['libretranslate'] = True
+            self.endpoint_status['mymemory'] = True
+        else:
+            self.endpoint_status['google'] = False
+            self.endpoint_status['libretranslate'] = False
+            self.endpoint_status['mymemory'] = False
+    
+    def is_endpoint_disabled(self, endpoint):
+        if endpoint not in self.circuit_breaker:
+            return False
+        failures, last_failure = self.circuit_breaker[endpoint]
+        if failures >= self.config['circuit_breaker_threshold']:
+            if time.time() - last_failure < self.config['circuit_breaker_timeout']:
+                return True
+            else:
+                del self.circuit_breaker[endpoint]
+        return False
+    
+    def record_endpoint_failure(self, endpoint):
+        if endpoint not in self.circuit_breaker:
+            self.circuit_breaker[endpoint] = [0, 0]
+        self.circuit_breaker[endpoint][0] += 1
+        self.circuit_breaker[endpoint][1] = time.time()
+    
+    def validate_translation_readiness(self):
+        self.check_endpoint_health()
+        available = any(self.endpoint_status.values())
+        if not available:
+            if not DEEP_TRANSLATOR_AVAILABLE:
+                QMessageBox.warning(
+                    self, 
+                    "No Translation Services", 
+                    "No translation services are available.\n\n"
+                    "The 'deep-translator' package is not installed, so Google Translate, "
+                    "LibreTranslate, and MyMemory are unavailable.\n\n"
+                    "Please install deep-translator: pip install deep-translator"
+                )
+            else:
+                QMessageBox.warning(
+                    self, 
+                    "No Translation Services", 
+                    "No translation services are available. Please check your internet connection or configure alternative services."
+                )
+            return False
+        return True
+    
+
+    
+
     
     def translate_selected_cells(self, selected_items, source_lang, target_lang):
         """Translate selected cells"""
-        total_cells = len(selected_items)
+        if not self.validate_translation_readiness():
+            return
         
-        # DeepLX endpoint
-        endpoint = "http://127.0.0.1:1188/translate"
+        total_cells = len(selected_items)
         
         # Create progress dialog
         progress = QProgressDialog("Translating selected cells...", "Cancel", 0, total_cells, self)
@@ -1708,53 +1619,42 @@ class CSVEditorWindow(QMainWindow):
         
         translated_count = 0
         failed_count = 0
+        consecutive_failures = 0
+        base_delay = self.config['base_delay']
+        max_delay = 60.0
+        current_delay = base_delay
+        current_service = ""
         
         for idx, item in enumerate(selected_items):
             if progress.wasCanceled():
                 break
             
             progress.setValue(idx)
-            progress.setLabelText(f"Translating cell {idx + 1} of {total_cells}...")
-            QApplication.processEvents()
-            
-            # Get cell text
             cell_text = item.text().strip()
             if not cell_text:
                 continue
             
-            # Translate
+            # Translate (retry logic is now centralized in translate_text)
             try:
-                data = {
-                    "text": cell_text,
-                    "source_lang": source_lang,
-                    "target_lang": target_lang
-                }
+                result, service_used = self.translate_text(cell_text, source_lang, target_lang)
+                current_service = service_used
                 
-                response = requests.post(
-                    endpoint,
-                    json=data,
-                    headers={"Content-Type": "application/json"},
-                    timeout=15
-                )
+                item.setText(result)
+                translated_count += 1
+                consecutive_failures = 0
+                current_delay = max(base_delay, current_delay * 0.9)
+                progress.setLabelText(f"Translating cell {idx + 1} of {total_cells}... (service: {current_service}, delay: {current_delay:.1f}s)")
                 
-                if response.status_code == 200:
-                    result = response.json()
-                    translated_text = result.get("data") or result.get("text", "")
-                    
-                    if translated_text and not translated_text.startswith("http"):
-                        item.setText(translated_text)
-                        translated_count += 1
-                        # Add delay to avoid rate limiting
-                        time.sleep(0.5)
-                    else:
-                        failed_count += 1
-                else:
-                    failed_count += 1
-                    print(f"HTTP {response.status_code}: {response.text}")
-                    
+                # Rate limiting with jitter
+                time.sleep(current_delay + random.uniform(0, current_delay * 0.1))
             except Exception as e:
                 failed_count += 1
-                print(f"Translation failed: {e}")
+                consecutive_failures += 1
+                # Adaptive backoff for consecutive failures
+                wait_time = min(max_delay, base_delay * (2 ** min(consecutive_failures - 1, 4)))
+                current_delay = min(max_delay, current_delay * 1.5)
+                progress.setLabelText(f"⚠️ Failed cell {idx + 1}. Waiting {wait_time:.1f}s...")
+                time.sleep(wait_time)
         
         progress.setValue(total_cells)
         
@@ -1769,7 +1669,11 @@ class CSVEditorWindow(QMainWindow):
             QMessageBox.warning(
                 self, "Translation Failed",
                 "No cells were translated.\n\n"
-                "Make sure DeepLX is running (Settings > DeepLX Translation Settings)"
+                "Possible causes:\n"
+                "• All translation services are unavailable\n"
+                "• Network connection issues\n"
+                "• Rate limiting on all services\n\n"
+                "Check Settings > Translation Services Configuration."
             )
     
     def show_column_context_menu(self, position):
@@ -1856,6 +1760,18 @@ class CSVEditorWindow(QMainWindow):
         target_lang.setPlaceholderText("e.g., EN, ZH, JA, KO")
         layout.addRow("Target Language:", target_lang)
         
+        # Translation service
+        service_combo = QComboBox()
+        for service in TranslationService:
+            service_combo.addItem(service.value.capitalize(), service.value)
+        service_combo.setCurrentText(self.config['preferred_service'].capitalize())
+        layout.addRow("Translation Service:", service_combo)
+        
+        # Use fallback
+        use_fallback = QCheckBox("Use all available services as fallback")
+        use_fallback.setChecked(True)
+        layout.addRow(use_fallback)
+        
         # Update source language when source column changes
         def update_source_lang():
             lang = detect_lang_code(source_combo.currentText())
@@ -1864,17 +1780,22 @@ class CSVEditorWindow(QMainWindow):
         source_combo.currentTextChanged.connect(update_source_lang)
         
         # Info label with status check
-        def check_deeplx_for_info():
-            try:
-                requests.get("http://127.0.0.1:1188", timeout=1)
-                return "DeepLX is running - ready to translate."
-            except:
-                return "DeepLX is not running. Go to Settings > DeepLX Translation Settings to start it."
-        
-        info_label = QLabel(check_deeplx_for_info())
+        info_label = QLabel("Checking translation services...")
         info_label.setWordWrap(True)
         info_label.setStyleSheet("color: gray; font-size: 10px;")
         layout.addRow(info_label)
+        
+        def update_info():
+            self.check_endpoint_health()
+            available = [s for s in self.endpoint_status if self.endpoint_status[s]]
+            if available:
+                info_label.setText(f"Available services: {', '.join(available)}")
+                info_label.setStyleSheet("color: green; font-size: 10px;")
+            else:
+                info_label.setText("No translation services available")
+                info_label.setStyleSheet("color: red; font-size: 10px;")
+        
+        update_info()
         
         # Buttons
         button_layout = QHBoxLayout()
@@ -1894,10 +1815,20 @@ class CSVEditorWindow(QMainWindow):
             source_col = source_combo.currentData()
             src_lang = source_lang.text().strip().upper()
             tgt_lang = target_lang.text().strip().upper()
+            service = service_combo.currentData()
+            fallback = use_fallback.isChecked()
             
             if not src_lang or not tgt_lang:
                 QMessageBox.warning(self, "Invalid Input", "Please enter both source and target languages.")
                 return
+            
+            # Update config
+            self.config['preferred_service'] = service
+            if fallback:
+                self.config['priority_order'] = [service] + [s for s in self.config['priority_order'] if s != service]
+            else:
+                self.config['priority_order'] = [service]
+            self.save_config()
             
             # Start translation
             self.translate_column(source_col, target_column, src_lang, tgt_lang)
@@ -1928,18 +1859,35 @@ class CSVEditorWindow(QMainWindow):
         target_lang.setPlaceholderText("e.g., EN, ZH, JA, KO")
         layout.addRow("Target Language:", target_lang)
         
-        # Info label with status check
-        def check_deeplx_for_info():
-            try:
-                requests.get("http://127.0.0.1:1188", timeout=1)
-                return "DeepLX is running - ready to translate."
-            except:
-                return "DeepLX is not running. Go to Settings > DeepLX Translation Settings to start it."
+        # Translation service
+        service_combo = QComboBox()
+        for service in TranslationService:
+            service_combo.addItem(service.value.capitalize(), service.value)
+        service_combo.setCurrentText(self.config['preferred_service'].capitalize())
+        layout.addRow("Translation Service:", service_combo)
         
-        info_label2 = QLabel(check_deeplx_for_info())
-        info_label2.setWordWrap(True)
-        info_label2.setStyleSheet("color: gray; font-size: 10px;")
-        layout.addRow(info_label2)
+        # Use fallback
+        use_fallback = QCheckBox("Use all available services as fallback")
+        use_fallback.setChecked(True)
+        layout.addRow(use_fallback)
+        
+        # Info label
+        status_label = QLabel("Checking translation services...")
+        status_label.setWordWrap(True)
+        status_label.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addRow(status_label)
+        
+        def update_status():
+            self.check_endpoint_health()
+            available = [s for s in self.endpoint_status if self.endpoint_status[s]]
+            if available:
+                status_label.setText(f"Available services: {', '.join(available)}")
+                status_label.setStyleSheet("color: green; font-size: 10px;")
+            else:
+                status_label.setText("No translation services available")
+                status_label.setStyleSheet("color: red; font-size: 10px;")
+        
+        update_status()
         
         # Buttons
         button_layout = QHBoxLayout()
@@ -1958,22 +1906,30 @@ class CSVEditorWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             src_lang = source_lang.text().strip().upper()
             tgt_lang = target_lang.text().strip().upper()
+            service = service_combo.currentData()
+            fallback = use_fallback.isChecked()
             
             if not src_lang or not tgt_lang:
                 QMessageBox.warning(self, "Invalid Input", "Please enter both source and target languages.")
                 return
             
+            # Update config
+            self.config['preferred_service'] = service
+            if fallback:
+                self.config['priority_order'] = [service] + [s for s in self.config['priority_order'] if s != service]
+            else:
+                self.config['priority_order'] = [service]
+            self.save_config()
+            
             # Start translation
             self.translate_selected_cells(selected_items, src_lang, tgt_lang)
     
     def translate_column(self, source_col, target_col, source_lang, target_lang):
-        """Translate all cells from source column to target column using DeepLX API"""
-        row_count = self.csv_table.rowCount()
+        """Translate all cells from source column to target column"""
+        if not self.validate_translation_readiness():
+            return
         
-        # DeepLX API endpoints to try (prioritize local)
-        endpoints = [
-            "http://127.0.0.1:1188/translate",  # Local DeepLX (most reliable)
-        ]
+        row_count = self.csv_table.rowCount()
         
         # Create progress dialog
         progress = QProgressDialog("Translating...", "Cancel", 0, row_count, self)
@@ -1982,15 +1938,26 @@ class CSVEditorWindow(QMainWindow):
         
         translated_count = 0
         failed_count = 0
-        current_endpoint = 0
+        consecutive_failures = 0
+        base_delay = self.config['base_delay']
+        max_delay = 60.0
+        current_delay = base_delay
+        current_service = ""
+        paused = False
+        
+        pause_btn = QPushButton("Pause")
+        progress.setCancelButton(pause_btn)
+        pause_btn.clicked.connect(lambda: setattr(progress, 'paused', not getattr(progress, 'paused', False)))
         
         for row in range(row_count):
             if progress.wasCanceled():
                 break
             
+            while getattr(progress, 'paused', False):
+                QApplication.processEvents()
+                time.sleep(0.1)
+            
             progress.setValue(row)
-            progress.setLabelText(f"Translating row {row + 1} of {row_count}...")
-            QApplication.processEvents()
             
             # Get source text
             source_item = self.csv_table.item(row, source_col)
@@ -1999,70 +1966,33 @@ class CSVEditorWindow(QMainWindow):
             
             source_text = source_item.text()
             
-            # Try translation with fallback endpoints
-            translated = False
-            for attempt in range(len(endpoints)):
-                endpoint = endpoints[(current_endpoint + attempt) % len(endpoints)]
+            # Translate (retry logic is now centralized in translate_text)
+            try:
+                result, service_used = self.translate_text(source_text, source_lang, target_lang)
+                current_service = service_used
                 
-                try:
-                    # Prepare request data
-                    data = {
-                        "text": source_text,
-                        "source_lang": source_lang,
-                        "target_lang": target_lang
-                    }
-                    
-                    # Make request to DeepLX API
-                    response = requests.post(
-                        endpoint,
-                        json=data,
-                        headers={"Content-Type": "application/json"},
-                        timeout=15
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        
-                        # Extract translated text
-                        translated_text = result.get("data") or result.get("text", "")
-                        
-                        # Validate translation (check if it's not a URL or error message)
-                        if translated_text and not translated_text.startswith("http") and len(translated_text) > 0:
-                            # Update target cell
-                            target_item = self.csv_table.item(row, target_col)
-                            if target_item:
-                                target_item.setText(translated_text)
-                            else:
-                                self.csv_table.setItem(row, target_col, QTableWidgetItem(translated_text))
-                            
-                            translated_count += 1
-                            translated = True
-                            break
-                        else:
-                            # Invalid response, try next endpoint
-                            print(f"Invalid translation from {endpoint}: {translated_text}")
-                            print(f"Full response: {result}")
-                            continue
-                    elif response.status_code == 429:
-                        # Rate limited, try next endpoint
-                        print(f"Rate limited by {endpoint}")
-                        current_endpoint = (current_endpoint + 1) % len(endpoints)
-                        continue
-                    else:
-                        print(f"HTTP {response.status_code} from {endpoint}: {response.text}")
-                    
-                except requests.exceptions.RequestException as e:
-                    print(f"Endpoint {endpoint} failed: {e}")
-                    continue
-                except Exception as e:
-                    print(f"Error with endpoint {endpoint}: {e}")
-                    continue
-            
-            if not translated:
+                # Update target cell
+                target_item = self.csv_table.item(row, target_col)
+                if target_item:
+                    target_item.setText(result)
+                else:
+                    self.csv_table.setItem(row, target_col, QTableWidgetItem(result))
+                
+                translated_count += 1
+                consecutive_failures = 0
+                current_delay = max(base_delay, current_delay * 0.9)
+                progress.setLabelText(f"Translating row {row + 1} of {row_count}... (service: {current_service}, delay: {current_delay:.1f}s)")
+                
+                # Rate limiting with jitter
+                time.sleep(current_delay + random.uniform(0, current_delay * 0.1))
+            except Exception as e:
                 failed_count += 1
-            else:
-                # Add a small delay between successful translations to avoid rate limiting
-                time.sleep(0.5)  # 500ms delay
+                consecutive_failures += 1
+                # Adaptive backoff for consecutive failures
+                wait_time = min(max_delay, base_delay * (2 ** min(consecutive_failures - 1, 4)))
+                current_delay = min(max_delay, current_delay * 1.5)
+                progress.setLabelText(f"⚠️ Failed row {row + 1}. Waiting {wait_time:.1f}s...")
+                time.sleep(wait_time)
         
         progress.setValue(row_count)
         
@@ -2071,35 +2001,332 @@ class CSVEditorWindow(QMainWindow):
             message = f"Translation complete!\n\nTranslated: {translated_count} rows"
             if failed_count > 0:
                 message += f"\nFailed: {failed_count} rows"
-                if "503" in str(failed_count):  # Rate limit hint
-                    message += "\n\nNote: Some translations failed due to rate limiting."
             QMessageBox.information(self, "Translation Complete", message)
             self.status_bar.showMessage(f"Translated {translated_count} rows")
         else:
-            # Check if it's a rate limit issue
-            try:
-                test_response = requests.get("http://127.0.0.1:1188", timeout=2)
-                if test_response.status_code == 503 or "blocked" in test_response.text.lower():
-                    QMessageBox.warning(
-                        self, "Rate Limited", 
-                        "Your IP has been temporarily blocked by DeepL due to too many requests.\n\n"
-                        "Please wait a few minutes before trying again.\n\n"
-                        "The app now adds a 500ms delay between translations to prevent this."
-                    )
-                    return
-            except:
-                pass
-            
             QMessageBox.warning(
                 self, "Translation Failed", 
                 "No rows were translated.\n\n"
-                "DeepLX server is not running or not responding.\n\n"
-                "Please start DeepLX:\n"
-                "1. Go to Settings > DeepLX Translation Settings\n"
-                "2. Click 'Download & Setup DeepLX' (if not already done)\n"
-                "3. Click 'Start DeepLX Server'\n"
-                "4. Try translation again"
+                "Possible causes:\n"
+                "• All translation services are unavailable\n"
+                "• Network connection issues\n"
+                "• Rate limiting on all services\n\n"
+                "Check Settings > Translation Services Configuration."
             )
+    
+    def show_translation_config_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Translation Services Configuration")
+        dialog.setMinimumWidth(500)
+        dialog.setMinimumHeight(400)
+        
+        layout = QVBoxLayout()
+        
+        # Enabled services
+        enabled_group = QGroupBox("Enabled Services")
+        enabled_layout = QVBoxLayout()
+        
+        service_checks = {}
+        for service in TranslationService:
+            check = QCheckBox(service.value.capitalize())
+            check.setChecked(service.value in self.config['enabled_services'])
+            service_checks[service.value] = check
+            enabled_layout.addWidget(check)
+        
+        enabled_group.setLayout(enabled_layout)
+        layout.addWidget(enabled_group)
+        
+        # Priority order
+        priority_group = QGroupBox("Priority Order (drag to reorder)")
+        priority_layout = QVBoxLayout()
+        
+        priority_list = QListWidget()
+        for service in self.config['priority_order']:
+            item = QListWidgetItem(service.capitalize())
+            item.setData(Qt.ItemDataRole.UserRole, service)
+            priority_list.addItem(item)
+        
+        priority_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        priority_layout.addWidget(priority_list)
+        
+        priority_group.setLayout(priority_layout)
+        layout.addWidget(priority_group)
+        
+        # Settings
+        settings_group = QGroupBox("Settings")
+        settings_layout = QFormLayout()
+        
+        timeout_spin = QSpinBox()
+        timeout_spin.setRange(5, 120)
+        timeout_spin.setValue(self.config['request_timeout'])
+        settings_layout.addRow("Request Timeout (s):", timeout_spin)
+        
+        retry_spin = QSpinBox()
+        retry_spin.setRange(1, 10)
+        retry_spin.setValue(self.config['retry_count'])
+        settings_layout.addRow("Retry Count:", retry_spin)
+        
+        delay_spin = QDoubleSpinBox()
+        delay_spin.setRange(0.1, 30.0)
+        delay_spin.setValue(self.config['base_delay'])
+        settings_layout.addRow("Base Delay (s):", delay_spin)
+        
+        libre_url = QLineEdit(self.config.get('custom_libretranslate_url', 'https://libretranslate.com/translate'))
+        settings_layout.addRow("LibreTranslate URL:", libre_url)
+        
+        settings_group.setLayout(settings_layout)
+        layout.addWidget(settings_group)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        cancel_btn = QPushButton("Cancel")
+        button_layout.addWidget(save_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        # Set the dialog layout
+        dialog.setLayout(layout)
+        
+        save_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.config['enabled_services'] = [s for s in service_checks if service_checks[s].isChecked()]
+            self.config['priority_order'] = [priority_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(priority_list.count())]
+            self.config['request_timeout'] = timeout_spin.value()
+            self.config['retry_count'] = retry_spin.value()
+            self.config['base_delay'] = delay_spin.value()
+            self.config['custom_libretranslate_url'] = libre_url.text()
+            self.save_config()
+    
+    def show_translation_log(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Translation Log")
+        dialog.setMinimumWidth(800)
+        dialog.setMinimumHeight(600)
+        
+        layout = QVBoxLayout()
+        
+        # Summary statistics section
+        stats_group = QGroupBox("Summary Statistics")
+        stats_layout = QVBoxLayout()
+        
+        stats = self.get_translation_stats()
+        overall_stats = QLabel(
+            f"<b>Overall:</b> {stats['total']} translations | "
+            f"Success: {stats['successful']} ({stats['success_rate']:.1f}%) | "
+            f"Failed: {stats['failed']}"
+        )
+        stats_layout.addWidget(overall_stats)
+        
+        # Per-service statistics
+        if stats['by_service']:
+            service_stats_text = "<b>By Service:</b><br>"
+            for service, service_data in stats['by_service'].items():
+                service_stats_text += (
+                    f"&nbsp;&nbsp;• {service}: {service_data['total']} total, "
+                    f"{service_data['successful']} success, "
+                    f"{service_data['failed']} failed "
+                    f"({service_data['success_rate']:.1f}%)<br>"
+                )
+            service_stats_label = QLabel(service_stats_text)
+            stats_layout.addWidget(service_stats_label)
+        
+        stats_group.setLayout(stats_layout)
+        layout.addWidget(stats_group)
+        
+        # Log entries list
+        log_label = QLabel("Recent Translations (last 100):")
+        layout.addWidget(log_label)
+        
+        log_list = QListWidget()
+        log_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        
+        # Populate log list with recent entries
+        for entry in reversed(self.translation_log[-100:]):
+            time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(entry['timestamp']))
+            status = "✓" if entry['success'] else "✗"
+            source_preview = entry['source'][:40] + "..." if len(entry['source']) > 40 else entry['source']
+            target_preview = entry['target'][:40] + "..." if len(entry['target']) > 40 else entry['target']
+            
+            item_text = f"{status} {time_str} [{entry['service']}] {source_preview} → {target_preview}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, entry)  # Store full entry data
+            
+            # Color code by status
+            if entry['success']:
+                item.setForeground(QColor(0, 128, 0))  # Green for success
+            else:
+                item.setForeground(QColor(200, 0, 0))  # Red for failure
+            
+            log_list.addItem(item)
+        
+        layout.addWidget(log_list)
+        
+        # Details section
+        details_group = QGroupBox("Selected Entry Details")
+        details_layout = QVBoxLayout()
+        details_text = QTextEdit()
+        details_text.setReadOnly(True)
+        details_text.setMaximumHeight(150)
+        details_text.setPlainText("Select an entry to view details...")
+        details_layout.addWidget(details_text)
+        details_group.setLayout(details_layout)
+        layout.addWidget(details_group)
+        
+        # Update details when selection changes
+        def update_details():
+            selected_items = log_list.selectedItems()
+            if selected_items:
+                entry = selected_items[0].data(Qt.ItemDataRole.UserRole)
+                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(entry['timestamp']))
+                details = f"Timestamp: {time_str}\n"
+                details += f"Service: {entry['service']}\n"
+                details += f"Status: {'SUCCESS' if entry['success'] else 'FAILED'}\n"
+                details += f"Source Text: {entry['source']}\n"
+                details += f"Target Text: {entry['target']}\n"
+                if not entry['success'] and entry['error']:
+                    details += f"\nError Details:\n{entry['error']}"
+                details_text.setPlainText(details)
+            else:
+                details_text.setPlainText("Select an entry to view details...")
+        
+        log_list.itemSelectionChanged.connect(update_details)
+        
+        # Button layout
+        button_layout = QHBoxLayout()
+        
+        copy_details_btn = QPushButton("Copy Error Details")
+        copy_details_btn.setToolTip("Copy error details of selected failed entry to clipboard")
+        def copy_error_details():
+            selected_items = log_list.selectedItems()
+            if selected_items:
+                entry = selected_items[0].data(Qt.ItemDataRole.UserRole)
+                if not entry['success']:
+                    time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(entry['timestamp']))
+                    error_info = f"Translation Error Report\n"
+                    error_info += f"{'=' * 50}\n"
+                    error_info += f"Timestamp: {time_str}\n"
+                    error_info += f"Service: {entry['service']}\n"
+                    error_info += f"Source Language: (from translation context)\n"
+                    error_info += f"Target Language: (from translation context)\n"
+                    error_info += f"Source Text: {entry['source']}\n"
+                    error_info += f"Error Message: {entry['error']}\n"
+                    error_info += f"{'=' * 50}\n"
+                    
+                    clipboard = QApplication.clipboard()
+                    clipboard.setText(error_info)
+                    QMessageBox.information(dialog, "Copied", "Error details copied to clipboard.")
+                else:
+                    QMessageBox.information(dialog, "No Error", "Selected entry was successful (no error to copy).")
+            else:
+                QMessageBox.warning(dialog, "No Selection", "Please select a log entry first.")
+        
+        copy_details_btn.clicked.connect(copy_error_details)
+        button_layout.addWidget(copy_details_btn)
+        
+        export_json_btn = QPushButton("Export to JSON")
+        export_json_btn.setToolTip("Export full log to JSON file")
+        export_json_btn.clicked.connect(lambda: self.export_translation_log('json'))
+        button_layout.addWidget(export_json_btn)
+        
+        export_csv_btn = QPushButton("Export to CSV")
+        export_csv_btn.setToolTip("Export log to CSV file")
+        export_csv_btn.clicked.connect(lambda: self.export_translation_log('csv'))
+        button_layout.addWidget(export_csv_btn)
+        
+        clear_btn = QPushButton("Clear Log")
+        clear_btn.clicked.connect(lambda: self.clear_translation_log() or dialog.close())
+        button_layout.addWidget(clear_btn)
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.close)
+        button_layout.addWidget(close_btn)
+        
+        layout.addLayout(button_layout)
+        
+        dialog.setLayout(layout)
+        dialog.exec()
+    
+    def get_translation_stats(self):
+        """Calculate detailed translation statistics including per-service breakdown"""
+        total = len(self.translation_log)
+        successful = sum(1 for e in self.translation_log if e['success'])
+        failed = total - successful
+        success_rate = (successful / total * 100) if total > 0 else 0
+        
+        # Per-service statistics
+        by_service = {}
+        for entry in self.translation_log:
+            service = entry['service']
+            if service not in by_service:
+                by_service[service] = {'total': 0, 'successful': 0, 'failed': 0}
+            
+            by_service[service]['total'] += 1
+            if entry['success']:
+                by_service[service]['successful'] += 1
+            else:
+                by_service[service]['failed'] += 1
+        
+        # Calculate success rate per service
+        for service in by_service:
+            service_total = by_service[service]['total']
+            service_successful = by_service[service]['successful']
+            by_service[service]['success_rate'] = (service_successful / service_total * 100) if service_total > 0 else 0
+        
+        return {
+            'total': total,
+            'successful': successful,
+            'failed': failed,
+            'success_rate': success_rate,
+            'by_service': by_service
+        }
+    
+    def export_translation_log(self, format_type='json'):
+        """Export translation log to JSON or CSV format"""
+        if format_type == 'json':
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Export Translation Log", "", "JSON Files (*.json);;All Files (*)"
+            )
+            if file_path:
+                try:
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        json.dump(self.translation_log, f, indent=2, ensure_ascii=False)
+                    QMessageBox.information(self, "Export Success", f"Log exported to {file_path}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Export Failed", f"Failed to export log:\n{str(e)}")
+        
+        elif format_type == 'csv':
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Export Translation Log", "", "CSV Files (*.csv);;All Files (*)"
+            )
+            if file_path:
+                try:
+                    with open(file_path, 'w', encoding='utf-8', newline='') as f:
+                        writer = csv.writer(f)
+                        # Write header
+                        writer.writerow(['Timestamp', 'Service', 'Status', 'Source Text', 'Target Text', 'Error'])
+                        
+                        # Write data
+                        for entry in self.translation_log:
+                            time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(entry['timestamp']))
+                            status = 'SUCCESS' if entry['success'] else 'FAILED'
+                            writer.writerow([
+                                time_str,
+                                entry['service'],
+                                status,
+                                entry['source'],
+                                entry['target'],
+                                entry.get('error', '')
+                            ])
+                    QMessageBox.information(self, "Export Success", f"Log exported to {file_path}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Export Failed", f"Failed to export log:\n{str(e)}")
+    
+    def clear_translation_log(self):
+        self.translation_log = []
+        QMessageBox.information(self, "Log Cleared", "Translation log has been cleared.")
 
 
 
