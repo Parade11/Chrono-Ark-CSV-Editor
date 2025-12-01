@@ -107,8 +107,6 @@ Automatically translate content from one column to another using multiple transl
    - ES = Spanish
    - And more...
 
-The app supports multiple translation services: Google Translate and MyMemory.
-
 #### Configuring Translation Services
 
 To configure translation services:
@@ -118,13 +116,6 @@ To configure translation services:
 4. Adjust timeouts and retry settings
 
 The automatic fallback mechanism tries services in priority order.
-
-## Translation Services
-
-The app supports multiple translation services with different strengths:
-
-- **Google Translate**: Reliable and widely supported, with a free tier available; good for most languages.
-- **MyMemory**: Free up to 1000 requests per day, suitable for small batches and occasional use.
 
 ## Requirements
 
