@@ -12,7 +12,7 @@ A modern Python desktop application for editing CSV files, designed to simplify 
 - **Save Functionality**: Save changes with Ctrl+S or through the File menu
 - **Remove Files**: Remove files from the list when no longer needed
 - **Modern UI**: Clean, professional interface built with PyQt6
-- **Multiple Translation Services**: Support for Google Translate, LibreTranslate, and MyMemory with automatic fallback
+- **Multiple Translation Services**: Support for Google Translate and MyMemory with automatic fallback
 - **Configurable Translation Settings**: Customize timeouts, retries, and service priorities
 
 ## Installation
@@ -107,7 +107,7 @@ Automatically translate content from one column to another using multiple transl
    - ES = Spanish
    - And more...
 
-The app supports multiple translation services: Google Translate, LibreTranslate, and MyMemory.
+The app supports multiple translation services: Google Translate and MyMemory.
 
 #### Configuring Translation Services
 
@@ -115,8 +115,7 @@ To configure translation services:
 1. Go to `Settings > Translation Services Configuration`
 2. Enable/disable specific services
 3. Set priority order for fallback
-4. Configure custom URLs (e.g., for LibreTranslate)
-5. Adjust timeouts and retry settings
+4. Adjust timeouts and retry settings
 
 The automatic fallback mechanism tries services in priority order.
 
@@ -125,7 +124,6 @@ The automatic fallback mechanism tries services in priority order.
 The app supports multiple translation services with different strengths:
 
 - **Google Translate**: Reliable and widely supported, with a free tier available; good for most languages.
-- **LibreTranslate**: Open-source and self-hostable, privacy-focused; requires a server URL.
 - **MyMemory**: Free up to 1000 requests per day, suitable for small batches and occasional use.
 
 ## Requirements

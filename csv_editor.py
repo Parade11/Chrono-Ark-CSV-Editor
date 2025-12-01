@@ -23,7 +23,7 @@ from PyQt6.QtGui import QAction, QKeySequence, QColor
 
 # New imports for translation services
 try:
-    from deep_translator import GoogleTranslator, LibreTranslator, MyMemoryTranslator
+    from deep_translator import GoogleTranslator, MyMemoryTranslator
     DEEP_TRANSLATOR_AVAILABLE = True
 except ImportError:
     DEEP_TRANSLATOR_AVAILABLE = False
@@ -36,7 +36,6 @@ except ImportError:
 
 class TranslationService(Enum):
     GOOGLE = "google"
-    LIBRETRANSLATE = "libretranslate"
     MYMEMORY = "mymemory"
 
 
@@ -72,15 +71,25 @@ class CSVEditorWindow(QMainWindow):
         
         # Set defaults
         self.config.setdefault('preferred_service', 'google')
-        self.config.setdefault('custom_libretranslate_url', 'https://libretranslate.com/translate')
         self.config.setdefault('request_timeout', 15)
         self.config.setdefault('retry_count', 3)
         self.config.setdefault('base_delay', 8.0)
-        self.config.setdefault('enabled_services', ['google', 'libretranslate', 'mymemory'])
-        self.config.setdefault('priority_order', ['google', 'libretranslate', 'mymemory'])
+        self.config.setdefault('enabled_services', ['google', 'mymemory'])
+        self.config.setdefault('priority_order', ['google', 'mymemory'])
         self.config.setdefault('last_successful_endpoints', {})
         self.config.setdefault('circuit_breaker_threshold', 5)
         self.config.setdefault('circuit_breaker_timeout', 300)  # 5 minutes
+        
+        # Clean up invalid services from config
+        valid_services = [s.value for s in TranslationService]
+        self.config['enabled_services'] = [s for s in self.config['enabled_services'] if s in valid_services]
+        self.config['priority_order'] = [s for s in self.config['priority_order'] if s in valid_services]
+        
+        # Ensure at least one service is enabled
+        if not self.config['enabled_services']:
+            self.config['enabled_services'] = ['google']
+        if not self.config['priority_order']:
+            self.config['priority_order'] = ['google']
     
     def save_config(self):
         config_path = Path.home() / ".csv_editor" / "config.json"
@@ -1450,17 +1459,53 @@ class CSVEditorWindow(QMainWindow):
         translator = GoogleTranslator(source=source_lang.lower(), target=target_lang.lower())
         return translator.translate(text)
     
-    def translate_with_libretranslate(self, text, source_lang, target_lang):
-        if not DEEP_TRANSLATOR_AVAILABLE:
-            raise Exception("deep-translator not available")
-        url = self.config.get('custom_libretranslate_url', 'https://libretranslate.com/translate')
-        translator = LibreTranslator(base_url=url, source=source_lang.lower(), target=target_lang.lower())
-        return translator.translate(text)
-    
+
     def translate_with_mymemory(self, text, source_lang, target_lang):
         if not DEEP_TRANSLATOR_AVAILABLE:
             raise Exception("deep-translator not available")
-        translator = MyMemoryTranslator(source=source_lang.lower(), target=target_lang.lower())
+        
+        # MyMemory expects full locale codes (e.g., 'en-GB', 'ko-KR', 'ja-JP')
+        # Map common 2-letter codes to full locale codes
+        lang_map = {
+            'en': 'en-GB',
+            'ko': 'ko-KR',
+            'ja': 'ja-JP',
+            'zh': 'zh-CN',
+            'es': 'es-ES',
+            'fr': 'fr-FR',
+            'de': 'de-DE',
+            'it': 'it-IT',
+            'pt': 'pt-PT',
+            'ru': 'ru-RU',
+            'ar': 'ar-SA',
+            'hi': 'hi-IN',
+            'th': 'th-TH',
+            'vi': 'vi-VN',
+            'id': 'id-ID',
+            'tr': 'tr-TR',
+            'pl': 'pl-PL',
+            'nl': 'nl-NL',
+            'sv': 'sv-SE',
+            'da': 'da-DK',
+            'fi': 'fi-FI',
+            'no': 'nb-NO',
+            'cs': 'cs-CZ',
+            'hu': 'hu-HU',
+            'ro': 'ro-RO',
+            'uk': 'uk-UA',
+            'el': 'el-GR',
+            'he': 'he-IL',
+        }
+        
+        # Convert to lowercase and get first 2 letters
+        source_code = source_lang.lower()[:2]
+        target_code = target_lang.lower()[:2]
+        
+        # Map to full locale codes
+        source = lang_map.get(source_code, f"{source_code}-{source_code.upper()}")
+        target = lang_map.get(target_code, f"{target_code}-{target_code.upper()}")
+        
+        translator = MyMemoryTranslator(source=source, target=target)
         return translator.translate(text)
     
     def translate_text(self, text, source_lang, target_lang):
@@ -1487,8 +1532,6 @@ class CSVEditorWindow(QMainWindow):
             try:
                 if service == 'google':
                     result = self.translate_with_google(text, source_lang, target_lang)
-                elif service == 'libretranslate':
-                    result = self.translate_with_libretranslate(text, source_lang, target_lang)
                 elif service == 'mymemory':
                     result = self.translate_with_mymemory(text, source_lang, target_lang)
                 else:
@@ -1552,14 +1595,12 @@ class CSVEditorWindow(QMainWindow):
     def check_endpoint_health(self):
         self.endpoint_status = {}
         
-        # Only mark Google/LibreTranslate/MyMemory as available if deep-translator is installed
+        # Only mark Google/MyMemory as available if deep-translator is installed
         if DEEP_TRANSLATOR_AVAILABLE:
             self.endpoint_status['google'] = True
-            self.endpoint_status['libretranslate'] = True
             self.endpoint_status['mymemory'] = True
         else:
             self.endpoint_status['google'] = False
-            self.endpoint_status['libretranslate'] = False
             self.endpoint_status['mymemory'] = False
     
     def is_endpoint_disabled(self, endpoint):
@@ -1588,8 +1629,8 @@ class CSVEditorWindow(QMainWindow):
                     self, 
                     "No Translation Services", 
                     "No translation services are available.\n\n"
-                    "The 'deep-translator' package is not installed, so Google Translate, "
-                    "LibreTranslate, and MyMemory are unavailable.\n\n"
+                    "The 'deep-translator' package is not installed, so Google Translate "
+                    "and MyMemory are unavailable.\n\n"
                     "Please install deep-translator: pip install deep-translator"
                 )
             else:
@@ -1686,7 +1727,7 @@ class CSVEditorWindow(QMainWindow):
             return
         
         menu = QMenu()
-        translate_action = QAction("Translate Entire Column with DeepL...", self)
+        translate_action = QAction("Translate Entire Column with...", self)
         translate_action.triggered.connect(lambda: self.show_translate_dialog(column))
         menu.addAction(translate_action)
         
@@ -1822,16 +1863,37 @@ class CSVEditorWindow(QMainWindow):
                 QMessageBox.warning(self, "Invalid Input", "Please enter both source and target languages.")
                 return
             
-            # Update config
+            # Update preferred service but don't modify priority_order permanently
             self.config['preferred_service'] = service
-            if fallback:
-                self.config['priority_order'] = [service] + [s for s in self.config['priority_order'] if s != service]
-            else:
-                self.config['priority_order'] = [service]
             self.save_config()
             
-            # Start translation
-            self.translate_column(source_col, target_column, src_lang, tgt_lang)
+            # Temporarily adjust priority for this translation only
+            if not fallback:
+                # Save original priority order
+                original_priority = self.config['priority_order'].copy()
+                original_enabled = self.config['enabled_services'].copy()
+                
+                # Temporarily set to single service
+                self.config['priority_order'] = [service]
+                self.config['enabled_services'] = [service]
+                
+                # Start translation
+                self.translate_column(source_col, target_column, src_lang, tgt_lang)
+                
+                # Restore original settings
+                self.config['priority_order'] = original_priority
+                self.config['enabled_services'] = original_enabled
+            else:
+                # Use fallback - put selected service first
+                temp_priority = [service] + [s for s in self.config['priority_order'] if s != service]
+                original_priority = self.config['priority_order'].copy()
+                self.config['priority_order'] = temp_priority
+                
+                # Start translation
+                self.translate_column(source_col, target_column, src_lang, tgt_lang)
+                
+                # Restore original priority
+                self.config['priority_order'] = original_priority
     
     def show_translate_cells_dialog(self):
         """Show dialog to translate selected cells"""
@@ -2041,10 +2103,14 @@ class CSVEditorWindow(QMainWindow):
         priority_layout = QVBoxLayout()
         
         priority_list = QListWidget()
+        # Get valid services from the enum
+        valid_services = [s.value for s in TranslationService]
+        # Filter priority order to only include valid services
         for service in self.config['priority_order']:
-            item = QListWidgetItem(service.capitalize())
-            item.setData(Qt.ItemDataRole.UserRole, service)
-            priority_list.addItem(item)
+            if service in valid_services:
+                item = QListWidgetItem(service.capitalize())
+                item.setData(Qt.ItemDataRole.UserRole, service)
+                priority_list.addItem(item)
         
         priority_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         priority_layout.addWidget(priority_list)
@@ -2071,9 +2137,6 @@ class CSVEditorWindow(QMainWindow):
         delay_spin.setValue(self.config['base_delay'])
         settings_layout.addRow("Base Delay (s):", delay_spin)
         
-        libre_url = QLineEdit(self.config.get('custom_libretranslate_url', 'https://libretranslate.com/translate'))
-        settings_layout.addRow("LibreTranslate URL:", libre_url)
-        
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
         
@@ -2097,7 +2160,6 @@ class CSVEditorWindow(QMainWindow):
             self.config['request_timeout'] = timeout_spin.value()
             self.config['retry_count'] = retry_spin.value()
             self.config['base_delay'] = delay_spin.value()
-            self.config['custom_libretranslate_url'] = libre_url.text()
             self.save_config()
     
     def show_translation_log(self):
