@@ -7,15 +7,16 @@ import subprocess
 import platform
 import time
 import chardet
+import re
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTreeWidget, QTreeWidgetItem, QTableWidget,
                              QTableWidgetItem, QSplitter, QMenuBar, QMenu, QFileDialog,
                              QMessageBox, QStatusBar, QInputDialog, QDialog, QLabel,
                              QComboBox, QLineEdit, QPushButton, QFormLayout, QProgressDialog,
-                             QTextEdit, QGroupBox)
+                             QTextEdit, QGroupBox, QCheckBox)
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtGui import QAction, QKeySequence, QColor
 
 DEEPLX_AVAILABLE = True  # We'll use direct API calls
 
@@ -28,6 +29,11 @@ class CSVEditorWindow(QMainWindow):
         self.imported_files = []  # Track imported files
         self.deeplx_process = None  # Track DeepLX process
         self.deeplx_path = Path.home() / ".csv_editor" / "deeplx"
+        self.search_results = []  # Store search results
+        self.current_search_index = -1  # Current position in search results
+        self.search_active = False  # Flag to prevent clearing during navigation
+        self.file_data_cache = {}  # Cache data for all imported files {file_path: csv_data}
+        self.modified_files = set()  # Track which files have been modified
         self.init_ui()
         
         # Auto-start DeepLX if it's installed but not running
@@ -71,6 +77,14 @@ class CSVEditorWindow(QMainWindow):
         # Enable multi-selection
         self.csv_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         
+        # Enable column reordering via drag-and-drop
+        self.csv_table.horizontalHeader().setSectionsMovable(True)
+        self.csv_table.horizontalHeader().setDragEnabled(True)
+        self.csv_table.horizontalHeader().setDragDropMode(self.csv_table.horizontalHeader().DragDropMode.InternalMove)
+        
+        # Connect column moved signal
+        self.csv_table.horizontalHeader().sectionMoved.connect(self.on_column_moved)
+        
         # Enable context menu on column headers
         self.csv_table.horizontalHeader().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.csv_table.horizontalHeader().customContextMenuRequested.connect(self.show_column_context_menu)
@@ -81,6 +95,9 @@ class CSVEditorWindow(QMainWindow):
         
         # Connect cell change signal to track edits
         self.csv_table.itemChanged.connect(self.on_cell_changed)
+        
+        # Connect cell click to clear search highlights
+        self.csv_table.cellClicked.connect(self.on_cell_clicked)
         
         splitter.addWidget(self.csv_table)
         
@@ -115,6 +132,11 @@ class CSVEditorWindow(QMainWindow):
         save_as_action.triggered.connect(self.save_file_as)
         file_menu.addAction(save_as_action)
         
+        save_all_action = QAction("Save All", self)
+        save_all_action.setShortcut("Ctrl+Alt+S")
+        save_all_action.triggered.connect(self.save_all_files)
+        file_menu.addAction(save_all_action)
+        
         file_menu.addSeparator()
         
         remove_action = QAction("Remove from List", self)
@@ -145,6 +167,56 @@ class CSVEditorWindow(QMainWindow):
         delete_column_action.setShortcut("Ctrl+Shift+D")
         delete_column_action.triggered.connect(self.delete_column)
         edit_menu.addAction(delete_column_action)
+        
+        edit_menu.addSeparator()
+        
+        # Row operations
+        add_row_action = QAction("Add Row", self)
+        add_row_action.setShortcut("Ctrl+Shift+R")
+        add_row_action.triggered.connect(self.add_row)
+        edit_menu.addAction(add_row_action)
+        
+        insert_row_action = QAction("Insert Row Before...", self)
+        insert_row_action.setShortcut("Ctrl+Shift+I")
+        insert_row_action.triggered.connect(self.insert_row_before)
+        edit_menu.addAction(insert_row_action)
+        
+        delete_row_action = QAction("Delete Row(s)", self)
+        delete_row_action.setShortcut("Ctrl+Shift+Delete")
+        delete_row_action.triggered.connect(self.delete_row)
+        edit_menu.addAction(delete_row_action)
+        
+        edit_menu.addSeparator()
+        
+        # Validation
+        validate_action = QAction("Validate Data...", self)
+        validate_action.triggered.connect(self.show_validation_dialog)
+        edit_menu.addAction(validate_action)
+        
+        # Find menu
+        find_menu = menubar.addMenu("Find")
+        
+        find_action = QAction("Find...", self)
+        find_action.setShortcut(QKeySequence.StandardKey.Find)
+        find_action.triggered.connect(self.show_find_dialog)
+        find_menu.addAction(find_action)
+        
+        find_next_action = QAction("Find Next", self)
+        find_next_action.setShortcut("F3")
+        find_next_action.triggered.connect(self.find_next)
+        find_menu.addAction(find_next_action)
+        
+        find_prev_action = QAction("Find Previous", self)
+        find_prev_action.setShortcut("Shift+F3")
+        find_prev_action.triggered.connect(self.find_previous)
+        find_menu.addAction(find_prev_action)
+        
+        find_menu.addSeparator()
+        
+        replace_action = QAction("Replace...", self)
+        replace_action.setShortcut(QKeySequence.StandardKey.Replace)
+        replace_action.triggered.connect(self.show_replace_dialog)
+        find_menu.addAction(replace_action)
         
         # Settings menu
         settings_menu = menubar.addMenu("Settings")
@@ -196,12 +268,26 @@ class CSVEditorWindow(QMainWindow):
         
     def on_file_selected(self, item, column):
         """Handle file selection from tree"""
+        # Save current file data to cache before switching
+        if self.current_file and self.csv_data:
+            self.sync_csv_data_from_table()
+            self.file_data_cache[self.current_file] = self.csv_data.copy()
+        
         file_path = item.data(0, Qt.ItemDataRole.UserRole)
         self.load_csv_file(file_path)
         
     def load_csv_file(self, file_path):
         """Load CSV file into table with encoding and dialect detection"""
         try:
+            # Check if we have cached data for this file
+            if file_path in self.file_data_cache:
+                print(f"Loading from cache: {file_path}")
+                self.csv_data = self.file_data_cache[file_path].copy()
+                self.current_file = file_path
+                self.display_csv_data()
+                self.status_bar.showMessage(f"Loaded: {Path(file_path).name} (from cache)")
+                return
+            
             # Step 1: Detect file encoding
             encoding = 'utf-8'  # Default
             try:
@@ -257,6 +343,9 @@ class CSVEditorWindow(QMainWindow):
             if not self.csv_data:
                 QMessageBox.warning(self, "Empty File", "The CSV file is empty.")
                 return
+            
+            # Cache the loaded data
+            self.file_data_cache[file_path] = self.csv_data.copy()
             
             self.current_file = file_path
             self.display_csv_data()
@@ -361,6 +450,55 @@ class CSVEditorWindow(QMainWindow):
         
 
             
+    def on_column_moved(self, logical_index, old_visual_index, new_visual_index):
+        """Handle column reordering and update csv_data"""
+        if not self.csv_data:
+            return
+        
+        try:
+            print(f"Column moved: logical={logical_index}, from={old_visual_index}, to={new_visual_index}")
+            
+            # Get the current visual order of columns
+            header = self.csv_table.horizontalHeader()
+            col_count = self.csv_table.columnCount()
+            
+            # Create a mapping of visual position to logical index
+            visual_to_logical = []
+            for visual_pos in range(col_count):
+                logical_pos = header.logicalIndex(visual_pos)
+                visual_to_logical.append(logical_pos)
+            
+            print(f"Visual to logical mapping: {visual_to_logical}")
+            
+            # Reorder csv_data based on the new visual order
+            new_csv_data = []
+            for row_data in self.csv_data:
+                new_row = [row_data[logical_idx] for logical_idx in visual_to_logical]
+                new_csv_data.append(new_row)
+            
+            self.csv_data = new_csv_data
+            
+            # Mark as modified
+            if self.current_file:
+                self.modified_files.add(self.current_file)
+                self.file_data_cache[self.current_file] = self.csv_data.copy()
+                self.update_file_tree_indicators()
+            
+            self.status_bar.showMessage(f"Column reordered: {self.csv_data[0][new_visual_index]}")
+            
+        except Exception as e:
+            print(f"Error reordering columns: {e}")
+            QMessageBox.warning(self, "Reorder Error", f"Failed to reorder columns:\n{str(e)}")
+    
+    def on_cell_clicked(self, row, col):
+        """Handle cell click - clear search highlights if not navigating"""
+        # Don't clear if we're actively navigating search results
+        if self.search_results and not self.search_active:
+            self.clear_search_highlights()
+            self.search_results = []
+            self.current_search_index = -1
+            self.status_bar.showMessage("Search cleared")
+    
     def on_cell_changed(self, item):
         """Handle individual cell changes and update csv_data"""
         if not self.csv_data or not item:
@@ -385,31 +523,144 @@ class CSVEditorWindow(QMainWindow):
             # Update the specific cell
             self.csv_data[data_row][col] = item.text()
             
+            # Mark current file as modified and update cache
+            if self.current_file:
+                self.modified_files.add(self.current_file)
+                self.file_data_cache[self.current_file] = self.csv_data.copy()
+                self.update_file_tree_indicators()
+            
         except Exception as e:
             print(f"Error updating cell data: {e}")
     
+    def validate_csv_data(self):
+        """Validate CSV data integrity and return issues"""
+        issues = []
+        
+        if not self.csv_data or len(self.csv_data) == 0:
+            issues.append("CSV data is empty")
+            return issues
+        
+        # Check headers
+        headers = self.csv_data[0]
+        if not headers or len(headers) == 0:
+            issues.append("No column headers found")
+            return issues
+        
+        # Check for empty headers
+        for idx, header in enumerate(headers):
+            if not header or not str(header).strip():
+                issues.append(f"Column {idx + 1} has an empty header")
+        
+        # Check for duplicate headers
+        header_counts = {}
+        for idx, header in enumerate(headers):
+            header_str = str(header).strip()
+            if header_str in header_counts:
+                issues.append(f"Duplicate header '{header_str}' found in columns {header_counts[header_str] + 1} and {idx + 1}")
+            else:
+                header_counts[header_str] = idx
+        
+        # Check column count consistency
+        expected_col_count = len(headers)
+        for row_idx, row_data in enumerate(self.csv_data[1:], start=1):
+            if len(row_data) != expected_col_count:
+                issues.append(
+                    f"Row {row_idx} has {len(row_data)} columns, expected {expected_col_count}"
+                )
+        
+        # Check for completely empty rows
+        for row_idx, row_data in enumerate(self.csv_data[1:], start=1):
+            if all(not str(cell).strip() for cell in row_data):
+                issues.append(f"Row {row_idx} is completely empty")
+        
+        return issues
+    
     def sync_csv_data_from_table(self):
-        """Synchronize self.csv_data with current table contents"""
+        """Synchronize self.csv_data with current table contents in visual order"""
         if not self.csv_table.rowCount() or not self.csv_table.columnCount():
             return
         
-        # Collect headers from table
-        headers = []
-        for col in range(self.csv_table.columnCount()):
-            header_item = self.csv_table.horizontalHeaderItem(col)
-            headers.append(header_item.text() if header_item else f"Column {col}")
+        header = self.csv_table.horizontalHeader()
+        col_count = self.csv_table.columnCount()
         
-        # Collect all rows
+        # Get columns in visual order (respecting drag-and-drop reordering)
+        visual_order = []
+        for visual_pos in range(col_count):
+            logical_pos = header.logicalIndex(visual_pos)
+            visual_order.append(logical_pos)
+        
+        print(f"Saving with visual order: {visual_order}")
+        
+        # Collect headers in visual order
+        headers = []
+        for logical_col in visual_order:
+            header_item = self.csv_table.horizontalHeaderItem(logical_col)
+            headers.append(header_item.text() if header_item else f"Column {logical_col}")
+        
+        # Collect all rows in visual order
         data = [headers]
         for row in range(self.csv_table.rowCount()):
             row_data = []
-            for col in range(self.csv_table.columnCount()):
-                item = self.csv_table.item(row, col)
+            for logical_col in visual_order:
+                item = self.csv_table.item(row, logical_col)
                 row_data.append(item.text() if item else "")
             data.append(row_data)
         
         # Update csv_data
         self.csv_data = data
+    
+    def show_validation_dialog(self):
+        """Show data validation results"""
+        if not self.current_file:
+            QMessageBox.warning(self, "No File", "Please load a CSV file first.")
+            return
+        
+        # Sync data first
+        self.sync_csv_data_from_table()
+        
+        # Validate
+        issues = self.validate_csv_data()
+        
+        # Show results
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Data Validation")
+        dialog.setMinimumWidth(500)
+        dialog.setMinimumHeight(400)
+        
+        layout = QVBoxLayout()
+        
+        if issues:
+            # Show issues
+            label = QLabel(f"<b>Found {len(issues)} issue(s):</b>")
+            layout.addWidget(label)
+            
+            issues_text = QTextEdit()
+            issues_text.setReadOnly(True)
+            issues_text.setPlainText("\n".join(f"• {issue}" for issue in issues))
+            layout.addWidget(issues_text)
+        else:
+            # No issues
+            label = QLabel("<b>Data validation passed.</b><br><br>No issues found.")
+            label.setStyleSheet("color: green; font-size: 14px;")
+            layout.addWidget(label)
+            
+            info_text = QTextEdit()
+            info_text.setReadOnly(True)
+            info_text.setMaximumHeight(150)
+            info_text.setPlainText(
+                f"Total rows: {len(self.csv_data) - 1}\n"
+                f"Total columns: {len(self.csv_data[0]) if self.csv_data else 0}\n"
+                f"Headers: {', '.join(self.csv_data[0]) if self.csv_data else 'None'}"
+            )
+            layout.addWidget(info_text)
+        
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn)
+        
+        dialog.setLayout(layout)
+        dialog.exec()
     
     def save_file(self):
         """Save current CSV file"""
@@ -421,11 +672,34 @@ class CSVEditorWindow(QMainWindow):
             # Sync data from table to csv_data
             self.sync_csv_data_from_table()
             
+            # Validate data before saving
+            issues = self.validate_csv_data()
+            if issues:
+                # Show validation warning
+                reply = QMessageBox.question(
+                    self, "Validation Issues",
+                    f"Found {len(issues)} validation issue(s):\n\n" +
+                    "\n".join(f"• {issue}" for issue in issues[:5]) +
+                    (f"\n... and {len(issues) - 5} more" if len(issues) > 5 else "") +
+                    "\n\nDo you want to save anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.No:
+                    return
+            
             # Write to file with quotes around all non-empty fields
             with open(self.current_file, 'w', encoding='utf-8', newline='') as f:
                 writer = csv.writer(f, quoting=csv.QUOTE_NONNUMERIC, lineterminator='\n')
                 writer.writerows(self.csv_data)
             
+            # Mark as saved (not modified)
+            if self.current_file in self.modified_files:
+                self.modified_files.remove(self.current_file)
+            
+            # Update cache
+            self.file_data_cache[self.current_file] = self.csv_data.copy()
+            
+            self.update_file_tree_indicators()
             self.status_bar.showMessage(f"Saved: {Path(self.current_file).name}")
             QMessageBox.information(self, "Success", "File saved successfully!")
             
@@ -452,6 +726,76 @@ class CSVEditorWindow(QMainWindow):
             self.file_tree.clear()
             for imported_file in self.imported_files:
                 self.add_file_to_tree(imported_file)
+            
+            self.update_file_tree_indicators()
+    
+    def save_all_files(self):
+        """Save all modified files"""
+        if not self.modified_files:
+            QMessageBox.information(self, "No Changes", "No files have been modified.")
+            return
+        
+        # Save current file data to cache first
+        if self.current_file and self.csv_data:
+            self.sync_csv_data_from_table()
+            self.file_data_cache[self.current_file] = self.csv_data.copy()
+        
+        saved_count = 0
+        failed_files = []
+        
+        for file_path in list(self.modified_files):
+            try:
+                # Get data from cache
+                if file_path in self.file_data_cache:
+                    data_to_save = self.file_data_cache[file_path]
+                elif file_path == self.current_file:
+                    data_to_save = self.csv_data
+                else:
+                    continue
+                
+                # Write to file
+                with open(file_path, 'w', encoding='utf-8', newline='') as f:
+                    writer = csv.writer(f, quoting=csv.QUOTE_NONNUMERIC, lineterminator='\n')
+                    writer.writerows(data_to_save)
+                
+                saved_count += 1
+                self.modified_files.discard(file_path)
+                
+            except Exception as e:
+                failed_files.append((Path(file_path).name, str(e)))
+        
+        # Update indicators
+        self.update_file_tree_indicators()
+        
+        # Show result
+        if failed_files:
+            error_msg = "\n".join([f"• {name}: {error}" for name, error in failed_files])
+            QMessageBox.warning(
+                self, "Save All - Partial Success",
+                f"Saved {saved_count} file(s) successfully.\n\n"
+                f"Failed to save {len(failed_files)} file(s):\n{error_msg}"
+            )
+        else:
+            QMessageBox.information(
+                self, "Save All Complete",
+                f"Successfully saved {saved_count} file(s)."
+            )
+        
+        self.status_bar.showMessage(f"Saved {saved_count} file(s)")
+    
+    def update_file_tree_indicators(self):
+        """Update file tree to show modified indicators"""
+        for i in range(self.file_tree.topLevelItemCount()):
+            item = self.file_tree.topLevelItem(i)
+            file_path = item.data(0, Qt.ItemDataRole.UserRole)
+            file_name = Path(file_path).name
+            
+            if file_path in self.modified_files:
+                # Show asterisk for modified files
+                item.setText(0, f"* {file_name}")
+            else:
+                # No asterisk for saved files
+                item.setText(0, file_name)
     
     def add_column(self):
         """Add a new column at the end"""
@@ -474,6 +818,12 @@ class CSVEditorWindow(QMainWindow):
             
             # Set column width
             self.csv_table.setColumnWidth(col_count, 150)
+            
+            # Mark as modified
+            if self.current_file:
+                self.modified_files.add(self.current_file)
+                self.file_data_cache[self.current_file] = self.csv_data.copy()
+                self.update_file_tree_indicators()
             
             self.status_bar.showMessage(f"Added column: {column_name}")
     
@@ -502,6 +852,12 @@ class CSVEditorWindow(QMainWindow):
             
             # Set column width
             self.csv_table.setColumnWidth(current_col, 150)
+            
+            # Mark as modified
+            if self.current_file:
+                self.modified_files.add(self.current_file)
+                self.file_data_cache[self.current_file] = self.csv_data.copy()
+                self.update_file_tree_indicators()
             
             self.status_bar.showMessage(f"Inserted column: {column_name}")
     
@@ -533,7 +889,505 @@ class CSVEditorWindow(QMainWindow):
             # Sync data to ensure consistency
             self.sync_csv_data_from_table()
             
+            # Mark as modified
+            if self.current_file:
+                self.modified_files.add(self.current_file)
+                self.file_data_cache[self.current_file] = self.csv_data.copy()
+                self.update_file_tree_indicators()
+            
             self.status_bar.showMessage(f"Deleted column: {column_name}")
+    
+    def add_row(self):
+        """Add a new empty row at the end"""
+        if not self.current_file:
+            QMessageBox.warning(self, "No File", "Please load a CSV file first.")
+            return
+        
+        # Get number of columns
+        col_count = self.csv_table.columnCount()
+        if col_count == 0:
+            QMessageBox.warning(self, "No Columns", "Cannot add row to a table with no columns.")
+            return
+        
+        # Temporarily disconnect signal
+        self.csv_table.itemChanged.disconnect(self.on_cell_changed)
+        
+        # Add row to table
+        row_position = self.csv_table.rowCount()
+        self.csv_table.insertRow(row_position)
+        
+        # Add empty cells
+        for col in range(col_count):
+            self.csv_table.setItem(row_position, col, QTableWidgetItem(""))
+        
+        # Add to csv_data
+        self.csv_data.append([""] * col_count)
+        
+        # Reconnect signal
+        self.csv_table.itemChanged.connect(self.on_cell_changed)
+        
+        # Mark as modified
+        if self.current_file:
+            self.modified_files.add(self.current_file)
+            self.file_data_cache[self.current_file] = self.csv_data.copy()
+            self.update_file_tree_indicators()
+        
+        self.status_bar.showMessage(f"Added row {row_position + 1}")
+    
+    def insert_row_before(self):
+        """Insert a new empty row before the current row"""
+        if not self.current_file:
+            QMessageBox.warning(self, "No File", "Please load a CSV file first.")
+            return
+        
+        current_row = self.csv_table.currentRow()
+        if current_row < 0:
+            QMessageBox.warning(self, "No Selection", "Please select a row first.")
+            return
+        
+        col_count = self.csv_table.columnCount()
+        
+        # Temporarily disconnect signal
+        self.csv_table.itemChanged.disconnect(self.on_cell_changed)
+        
+        # Insert row in table
+        self.csv_table.insertRow(current_row)
+        
+        # Add empty cells
+        for col in range(col_count):
+            self.csv_table.setItem(current_row, col, QTableWidgetItem(""))
+        
+        # Insert in csv_data (current_row + 1 because csv_data[0] is headers)
+        self.csv_data.insert(current_row + 1, [""] * col_count)
+        
+        # Reconnect signal
+        self.csv_table.itemChanged.connect(self.on_cell_changed)
+        
+        # Mark as modified
+        if self.current_file:
+            self.modified_files.add(self.current_file)
+            self.file_data_cache[self.current_file] = self.csv_data.copy()
+            self.update_file_tree_indicators()
+        
+        self.status_bar.showMessage(f"Inserted row at position {current_row + 1}")
+    
+    def delete_row(self):
+        """Delete selected row(s)"""
+        if not self.current_file:
+            QMessageBox.warning(self, "No File", "Please load a CSV file first.")
+            return
+        
+        # Get selected rows
+        selected_rows = set()
+        for item in self.csv_table.selectedItems():
+            selected_rows.add(item.row())
+        
+        if not selected_rows:
+            current_row = self.csv_table.currentRow()
+            if current_row < 0:
+                QMessageBox.warning(self, "No Selection", "Please select row(s) to delete.")
+                return
+            selected_rows.add(current_row)
+        
+        # Confirm deletion
+        row_count = len(selected_rows)
+        row_text = "row" if row_count == 1 else f"{row_count} rows"
+        
+        reply = QMessageBox.question(
+            self, "Delete Row(s)",
+            f"Are you sure you want to delete {row_text}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Temporarily disconnect signal
+            self.csv_table.itemChanged.disconnect(self.on_cell_changed)
+            
+            # Sort rows in descending order to delete from bottom to top
+            for row in sorted(selected_rows, reverse=True):
+                # Remove from table
+                self.csv_table.removeRow(row)
+                
+                # Remove from csv_data (row + 1 because csv_data[0] is headers)
+                if row + 1 < len(self.csv_data):
+                    del self.csv_data[row + 1]
+            
+            # Reconnect signal
+            self.csv_table.itemChanged.connect(self.on_cell_changed)
+            
+            self.status_bar.showMessage(f"Deleted {row_count} {row_text}")
+            
+            # Mark as modified and update cache
+            if self.current_file:
+                self.modified_files.add(self.current_file)
+                self.file_data_cache[self.current_file] = self.csv_data.copy()
+                self.update_file_tree_indicators()
+    
+    def show_find_dialog(self):
+        """Show find dialog"""
+        if not self.current_file:
+            QMessageBox.warning(self, "No File", "Please load a CSV file first.")
+            return
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Find")
+        dialog.setMinimumWidth(400)
+        
+        layout = QFormLayout()
+        
+        # Search text
+        search_input = QLineEdit()
+        search_input.setPlaceholderText("Enter text to find...")
+        layout.addRow("Find:", search_input)
+        
+        # Options
+        case_sensitive = QCheckBox("Case sensitive")
+        layout.addRow(case_sensitive)
+        
+        whole_word = QCheckBox("Whole word")
+        layout.addRow(whole_word)
+        
+        use_regex = QCheckBox("Regular expression")
+        layout.addRow(use_regex)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        find_all_btn = QPushButton("Find All")
+        find_next_btn = QPushButton("Find Next")
+        close_btn = QPushButton("Close")
+        button_layout.addWidget(find_all_btn)
+        button_layout.addWidget(find_next_btn)
+        button_layout.addWidget(close_btn)
+        layout.addRow(button_layout)
+        
+        dialog.setLayout(layout)
+        
+        # Connect buttons
+        def do_find_all():
+            self.perform_search(
+                search_input.text(),
+                case_sensitive.isChecked(),
+                whole_word.isChecked(),
+                use_regex.isChecked()
+            )
+        
+        def do_find_next():
+            if search_input.text():
+                # Only perform search if no results exist yet
+                if not self.search_results:
+                    self.perform_search(
+                        search_input.text(),
+                        case_sensitive.isChecked(),
+                        whole_word.isChecked(),
+                        use_regex.isChecked()
+                    )
+                # Navigate to next result
+                if self.search_results:
+                    self.find_next()
+        
+        find_all_btn.clicked.connect(do_find_all)
+        find_next_btn.clicked.connect(do_find_next)
+        
+        def close_and_clear():
+            # Clear highlights when closing dialog
+            if self.search_results:
+                self.clear_search_highlights()
+                self.search_results = []
+                self.current_search_index = -1
+            dialog.close()
+        
+        close_btn.clicked.connect(close_and_clear)
+        
+        # Allow Enter to find next
+        search_input.returnPressed.connect(do_find_next)
+        
+        # Clear highlights when dialog is closed (X button)
+        dialog.finished.connect(lambda: self.clear_search_highlights() if self.search_results else None)
+        
+        dialog.exec()
+    
+    def perform_search(self, search_text, case_sensitive, whole_word, use_regex):
+        """Perform search and highlight results"""
+        if not search_text:
+            return
+        
+        try:
+            # Clear previous highlights
+            self.clear_search_highlights()
+            self.search_results = []
+        except Exception as e:
+            print(f"Error in perform_search: {e}")
+            QMessageBox.critical(self, "Search Error", f"An error occurred during search:\n{str(e)}")
+            return
+        
+        # Prepare search pattern
+        if use_regex:
+            try:
+                if case_sensitive:
+                    pattern = re.compile(search_text)
+                else:
+                    pattern = re.compile(search_text, re.IGNORECASE)
+            except re.error as e:
+                QMessageBox.warning(self, "Invalid Regex", f"Invalid regular expression:\n{str(e)}")
+                return
+        else:
+            # Escape special regex characters
+            search_text_escaped = re.escape(search_text)
+            if whole_word:
+                search_text_escaped = r'\b' + search_text_escaped + r'\b'
+            if case_sensitive:
+                pattern = re.compile(search_text_escaped)
+            else:
+                pattern = re.compile(search_text_escaped, re.IGNORECASE)
+        
+        # Search through all cells
+        for row in range(self.csv_table.rowCount()):
+            for col in range(self.csv_table.columnCount()):
+                item = self.csv_table.item(row, col)
+                if item and item.text() and pattern.search(item.text()):
+                    self.search_results.append((row, col))
+                    # Highlight matching cell
+                    try:
+                        item.setBackground(QColor(255, 255, 0, 100))  # Light yellow
+                    except Exception as e:
+                        print(f"Error highlighting cell [{row}, {col}]: {e}")
+        
+        # Show results
+        if self.search_results:
+            self.current_search_index = 0
+            self.highlight_current_result()
+            self.status_bar.showMessage(f"Found {len(self.search_results)} matches")
+        else:
+            self.status_bar.showMessage("No matches found")
+            QMessageBox.information(self, "No Results", f"No matches found for '{search_text}'")
+    
+    def clear_search_highlights(self):
+        """Clear search highlights only from previously highlighted cells"""
+        try:
+            # Only clear highlights from cells that were in search results
+            for row, col in self.search_results:
+                item = self.csv_table.item(row, col)
+                if item:
+                    # Reset to default (transparent/no background)
+                    item.setData(Qt.ItemDataRole.BackgroundRole, None)
+        except Exception as e:
+            print(f"Error clearing highlights: {e}")
+    
+    def highlight_current_result(self):
+        """Highlight the current search result"""
+        if not self.search_results or self.current_search_index < 0:
+            return
+        
+        try:
+            # Set flag to prevent clearing during navigation
+            self.search_active = True
+            
+            # Reset all search results to light yellow
+            for idx, (row, col) in enumerate(self.search_results):
+                item = self.csv_table.item(row, col)
+                if item:
+                    if idx == self.current_search_index:
+                        # Current result: Orange
+                        item.setBackground(QColor(255, 165, 0, 150))
+                    else:
+                        # Other results: Light yellow
+                        item.setBackground(QColor(255, 255, 0, 100))
+            
+            # Scroll to current result
+            row, col = self.search_results[self.current_search_index]
+            self.csv_table.setCurrentCell(row, col)
+            item = self.csv_table.item(row, col)
+            if item:
+                self.csv_table.scrollToItem(item)
+            
+            self.status_bar.showMessage(
+                f"Match {self.current_search_index + 1} of {len(self.search_results)}"
+            )
+            
+            # Reset flag after a short delay
+            QTimer.singleShot(100, lambda: setattr(self, 'search_active', False))
+            
+        except Exception as e:
+            print(f"Error highlighting result: {e}")
+            self.search_active = False
+    
+    def find_next(self):
+        """Find next match"""
+        if not self.search_results:
+            QMessageBox.information(self, "No Results", "No search results. Use Find first.")
+            return
+        
+        self.search_active = True
+        self.current_search_index = (self.current_search_index + 1) % len(self.search_results)
+        self.highlight_current_result()
+    
+    def find_previous(self):
+        """Find previous match"""
+        if not self.search_results:
+            QMessageBox.information(self, "No Results", "No search results. Use Find first.")
+            return
+        
+        self.search_active = True
+        self.current_search_index = (self.current_search_index - 1) % len(self.search_results)
+        self.highlight_current_result()
+    
+    def show_replace_dialog(self):
+        """Show find and replace dialog"""
+        if not self.current_file:
+            QMessageBox.warning(self, "No File", "Please load a CSV file first.")
+            return
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Find and Replace")
+        dialog.setMinimumWidth(450)
+        
+        layout = QFormLayout()
+        
+        # Find text
+        find_input = QLineEdit()
+        find_input.setPlaceholderText("Enter text to find...")
+        layout.addRow("Find:", find_input)
+        
+        # Replace text
+        replace_input = QLineEdit()
+        replace_input.setPlaceholderText("Enter replacement text...")
+        layout.addRow("Replace with:", replace_input)
+        
+        # Options
+        case_sensitive = QCheckBox("Case sensitive")
+        layout.addRow(case_sensitive)
+        
+        whole_word = QCheckBox("Whole word")
+        layout.addRow(whole_word)
+        
+        use_regex = QCheckBox("Regular expression")
+        layout.addRow(use_regex)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        replace_btn = QPushButton("Replace")
+        replace_all_btn = QPushButton("Replace All")
+        close_btn = QPushButton("Close")
+        button_layout.addWidget(replace_btn)
+        button_layout.addWidget(replace_all_btn)
+        button_layout.addWidget(close_btn)
+        layout.addRow(button_layout)
+        
+        dialog.setLayout(layout)
+        
+        # Connect buttons
+        def do_replace():
+            if not self.search_results or self.current_search_index < 0:
+                # Perform search first
+                self.perform_search(
+                    find_input.text(),
+                    case_sensitive.isChecked(),
+                    whole_word.isChecked(),
+                    use_regex.isChecked()
+                )
+                if not self.search_results:
+                    return
+            
+            # Replace current match
+            row, col = self.search_results[self.current_search_index]
+            item = self.csv_table.item(row, col)
+            if item:
+                old_text = item.text()
+                if use_regex:
+                    try:
+                        if case_sensitive.isChecked():
+                            pattern = re.compile(find_input.text())
+                        else:
+                            pattern = re.compile(find_input.text(), re.IGNORECASE)
+                        new_text = pattern.sub(replace_input.text(), old_text)
+                    except re.error as e:
+                        QMessageBox.warning(dialog, "Invalid Regex", f"Invalid regular expression:\n{str(e)}")
+                        return
+                else:
+                    if case_sensitive.isChecked():
+                        new_text = old_text.replace(find_input.text(), replace_input.text())
+                    else:
+                        # Case-insensitive replace
+                        pattern = re.compile(re.escape(find_input.text()), re.IGNORECASE)
+                        new_text = pattern.sub(replace_input.text(), old_text)
+                
+                item.setText(new_text)
+            
+            # Move to next match
+            self.find_next()
+        
+        def do_replace_all():
+            find_text = find_input.text()
+            replace_text = replace_input.text()
+            
+            if not find_text:
+                return
+            
+            # Perform search
+            self.perform_search(
+                find_text,
+                case_sensitive.isChecked(),
+                whole_word.isChecked(),
+                use_regex.isChecked()
+            )
+            
+            if not self.search_results:
+                return
+            
+            # Confirm
+            reply = QMessageBox.question(
+                dialog, "Replace All",
+                f"Replace {len(self.search_results)} occurrences?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                replaced_count = 0
+                for row, col in self.search_results:
+                    item = self.csv_table.item(row, col)
+                    if item:
+                        old_text = item.text()
+                        if use_regex.isChecked():
+                            try:
+                                if case_sensitive.isChecked():
+                                    pattern = re.compile(find_text)
+                                else:
+                                    pattern = re.compile(find_text, re.IGNORECASE)
+                                new_text = pattern.sub(replace_text, old_text)
+                            except re.error:
+                                continue
+                        else:
+                            if case_sensitive.isChecked():
+                                new_text = old_text.replace(find_text, replace_text)
+                            else:
+                                pattern = re.compile(re.escape(find_text), re.IGNORECASE)
+                                new_text = pattern.sub(replace_text, old_text)
+                        
+                        item.setText(new_text)
+                        replaced_count += 1
+                
+                self.clear_search_highlights()
+                self.search_results = []
+                self.status_bar.showMessage(f"Replaced {replaced_count} occurrences")
+                QMessageBox.information(dialog, "Replace Complete", f"Replaced {replaced_count} occurrences")
+        
+        replace_btn.clicked.connect(do_replace)
+        replace_all_btn.clicked.connect(do_replace_all)
+        
+        def close_and_clear():
+            # Clear highlights when closing dialog
+            if self.search_results:
+                self.clear_search_highlights()
+                self.search_results = []
+                self.current_search_index = -1
+            dialog.close()
+        
+        close_btn.clicked.connect(close_and_clear)
+        
+        # Clear highlights when dialog is closed (X button)
+        dialog.finished.connect(lambda: self.clear_search_highlights() if self.search_results else None)
+        
+        dialog.exec()
     
     def show_deeplx_settings(self):
         """Show DeepLX settings dialog"""
@@ -1013,9 +1867,9 @@ class CSVEditorWindow(QMainWindow):
         def check_deeplx_for_info():
             try:
                 requests.get("http://127.0.0.1:1188", timeout=1)
-                return "✓ DeepLX is running - ready to translate!"
+                return "DeepLX is running - ready to translate."
             except:
-                return "⚠ DeepLX is not running. Go to Settings > DeepLX Translation Settings to start it."
+                return "DeepLX is not running. Go to Settings > DeepLX Translation Settings to start it."
         
         info_label = QLabel(check_deeplx_for_info())
         info_label.setWordWrap(True)
@@ -1078,9 +1932,9 @@ class CSVEditorWindow(QMainWindow):
         def check_deeplx_for_info():
             try:
                 requests.get("http://127.0.0.1:1188", timeout=1)
-                return "✓ DeepLX is running - ready to translate!"
+                return "DeepLX is running - ready to translate."
             except:
-                return "⚠ DeepLX is not running. Go to Settings > DeepLX Translation Settings to start it."
+                return "DeepLX is not running. Go to Settings > DeepLX Translation Settings to start it."
         
         info_label2 = QLabel(check_deeplx_for_info())
         info_label2.setWordWrap(True)
